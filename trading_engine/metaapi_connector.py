@@ -11,12 +11,19 @@ Configuration (variables d'environnement) :
     METAAPI_TOKEN           : token API généré depuis app.metaapi.cloud
     METAAPI_ACCOUNT_ID      : ID du compte MT5 déployé sur MetaApi (UUID)
     METAAPI_REGION          : région du datacenter (défaut: "new-york", autres: "london", "singapore")
+    METAAPI_GENERATION      : "g1" (défaut, ancienne infra) ou "g2" (nouvelle infra cloud-g2)
     METAAPI_SYMBOL          : symbole XAUUSD selon le broker (XM utilise "GOLD" ou "XAUUSD"
                               selon le type de compte — à vérifier dans MT5)
 
+Comment savoir si ton compte est g1 ou g2 :
+- Ouvre https://app.metaapi.cloud et regarde le badge de ton compte MT5.
+- Si tu vois "cloud-g2" affiché → METAAPI_GENERATION=g2
+- Sinon (ancien compte, badge "cloud") → METAAPI_GENERATION=g1
+- Les hostnames g2 contiennent ".g2." dans le domaine.
+
 Architecture MetaApi (important à comprendre) :
-- Client API (compte/positions/ordres)   : mt-client-api-v1.<region>.agiliumtrade.ai
-- Market Data API (candles historiques) : mt-market-data-client-api-v1.<region>.agiliumtrade.ai
+- Client API (compte/positions/ordres)   : mt-client-api-v1.<region>[.g2].agiliumtrade.ai
+- Market Data API (candles historiques) : mt-market-data-client-api-v1.<region>[.g2].agiliumtrade.ai
 Deux hostnames différents, même token d'authentification (header `auth-token`).
 """
 
@@ -28,10 +35,14 @@ import httpx
 
 logger = logging.getLogger("trading_engine.metaapi_connector")
 
-CLIENT_API_HOST_TEMPLATE = "https://mt-client-api-v1.{region}.agiliumtrade.ai"
-MARKET_DATA_HOST_TEMPLATE = "https://mt-market-data-client-api-v1.{region}.agiliumtrade.ai"
+# --- Hostnames selon la génération du compte MetaApi ---
+CLIENT_API_HOST_TEMPLATE_G1 = "https://mt-client-api-v1.{region}.agiliumtrade.ai"
+CLIENT_API_HOST_TEMPLATE_G2 = "https://mt-client-api-v1.{region}.g2.agiliumtrade.ai"
+MARKET_DATA_HOST_TEMPLATE_G1 = "https://mt-market-data-client-api-v1.{region}.agiliumtrade.ai"
+MARKET_DATA_HOST_TEMPLATE_G2 = "https://mt-market-data-client-api-v1.{region}.g2.agiliumtrade.ai"
 
 DEFAULT_REGION = "new-york"
+DEFAULT_GENERATION = "g1"
 DEFAULT_SYMBOL = "XAUUSD"
 
 # MetaApi utilise les codes MT5 natifs pour les timeframes
@@ -60,20 +71,41 @@ def get_config() -> Dict[str, str]:
     account_id = os.environ.get("METAAPI_ACCOUNT_ID")
     region = os.environ.get("METAAPI_REGION", DEFAULT_REGION)
     symbol = os.environ.get("METAAPI_SYMBOL", DEFAULT_SYMBOL)
+    generation = os.environ.get("METAAPI_GENERATION", DEFAULT_GENERATION)
 
     if not token or not account_id:
         raise MetaApiConfigError(
             "METAAPI_TOKEN et METAAPI_ACCOUNT_ID doivent être définis en variables d'environnement"
         )
-    return {"token": token, "account_id": account_id, "region": region, "symbol": symbol}
+    if generation not in ("g1", "g2"):
+        raise MetaApiConfigError(
+            f"METAAPI_GENERATION doit être 'g1' ou 'g2', reçu: {generation}"
+        )
+    return {
+        "token": token,
+        "account_id": account_id,
+        "region": region,
+        "symbol": symbol,
+        "generation": generation,
+    }
 
 
 def _client_host(config: Dict[str, str]) -> str:
-    return CLIENT_API_HOST_TEMPLATE.format(region=config["region"])
+    template = (
+        CLIENT_API_HOST_TEMPLATE_G2
+        if config.get("generation") == "g2"
+        else CLIENT_API_HOST_TEMPLATE_G1
+    )
+    return template.format(region=config["region"])
 
 
 def _market_data_host(config: Dict[str, str]) -> str:
-    return MARKET_DATA_HOST_TEMPLATE.format(region=config["region"])
+    template = (
+        MARKET_DATA_HOST_TEMPLATE_G2
+        if config.get("generation") == "g2"
+        else MARKET_DATA_HOST_TEMPLATE_G1
+    )
+    return template.format(region=config["region"])
 
 
 def _headers(config: Dict[str, str]) -> Dict[str, str]:
