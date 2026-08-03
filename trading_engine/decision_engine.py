@@ -1,30 +1,36 @@
 """
 decision_engine.py
 
-Moteur de décision principal. Reçoit le payload structuré (section 10 de la spec)
-et retourne une décision structurée: HOLD | ENTER | EXIT | REDUCE.
+Architecture B pure — Claude est le décideur, ce module l'assiste.
 
-Ce module orchestre: indicators, zones, price_action, risk_manager.
-Il ne fait AUCUN appel réseau — c'est une fonction pure prenant un dict en entrée
-et retournant un dict en sortie, pour rester testable de façon isolée.
+Flux à chaque appel:
+1. Calculer tous les indicateurs (SCD, IRV, FQE, zones, action de prix, etc.)
+2. Assembler un "dossier d'analyse" structuré et lisible par Claude
+3. Envoyer le dossier à Claude via claude_advisor.ask_claude
+4. Faire valider la décision de Claude par le risk manager (garde-fous durs)
+5. Retourner la décision finale au format attendu par l'API
+
+Le risk manager est AU-DESSUS de Claude — il peut refuser ou modifier sa
+décision. Claude propose, le code Python dispose.
 """
 
-from typing import Dict, List, Optional
+import logging
+from typing import Dict, List, Optional, Any
 
 from . import indicators as ind
 from . import zones as zn
 from . import price_action as pa
 from . import risk_manager as rm
+from . import claude_advisor
 
+logger = logging.getLogger("trading_engine.decision_engine")
 
 MACRO_EVENT_BUFFER_MINUTES = 60
 
 
+# --- Calculs de contexte (inchangés depuis l'ancienne version) ---
+
 def _macro_event_within_buffer(evenements_macro: List[Dict], buffer_minutes: int = MACRO_EVENT_BUFFER_MINUTES) -> bool:
-    """
-    Vérifie si un événement macro majeur est prévu dans les `buffer_minutes` à venir.
-    Chaque événement attendu: {"minutes_avant": float, "impact": "high"|"medium"|"low"}
-    """
     for event in evenements_macro:
         if event.get("impact") == "high" and event.get("minutes_avant", 9999) <= buffer_minutes:
             return True
@@ -32,22 +38,14 @@ def _macro_event_within_buffer(evenements_macro: List[Dict], buffer_minutes: int
 
 
 def compute_bias(payload: Dict) -> Dict:
-    """Étape A — Biais directionnel (D1/H4). Retourne SCD, structure, ema info."""
+    """Étape A — Biais directionnel (D1/H4)."""
     h4 = payload["H4"]
     ohlc_h4 = h4["ohlc"]
-
     ema50_h4 = h4.get("ema50") or ind.ema_last([c["close"] for c in ohlc_h4], 50)
     ema200_h4 = h4.get("ema200") or ind.ema_last([c["close"] for c in ohlc_h4], 200)
     structure_h4 = ind.detect_market_structure(ohlc_h4)
-
     price = payload["prix"]["actuel"]
-
-    return {
-        "ema50_h4": ema50_h4,
-        "ema200_h4": ema200_h4,
-        "structure_h4": structure_h4,
-        "price": price,
-    }
+    return {"ema50_h4": ema50_h4, "ema200_h4": ema200_h4, "structure_h4": structure_h4, "price": price}
 
 
 def compute_volatility_regime(payload: Dict) -> Dict:
@@ -55,16 +53,12 @@ def compute_volatility_regime(payload: Dict) -> Dict:
     h1 = payload["H1"]
     atr_current = h1.get("atr14")
     atr_avg20 = h1.get("atr14_moy20")
-
     if atr_current is None or atr_avg20 is None:
-        closes = [c["close"] for c in h1["ohlc"]]
         atr_series = ind.atr(h1["ohlc"], period=14)
         atr_current = atr_series[-1]
         atr_avg20 = ind.atr_average(atr_series, lookback=20)
-
     irv = ind.irv_index(atr_current, atr_avg20)
     regime = ind.irv_regime(irv)
-
     return {"atr_current": atr_current, "atr_avg20": atr_avg20, "irv": irv, "regime": regime}
 
 
@@ -73,246 +67,232 @@ def compute_zones(payload: Dict) -> List[Dict]:
     return zn.identify_zones(payload["D1"]["ohlc"], payload["H4"]["ohlc"], max_zones=4)
 
 
-def evaluate_fqe(
-    scd: int,
-    direction: str,
-    volatility_regime: str,
-    price_action_confirmed: bool,
-    zone_proximity: Optional[str],
-    macro_event_soon: bool,
-) -> Dict:
+# --- Assemblage du dossier d'analyse pour Claude ---
+
+def build_dossier(payload: Dict) -> Dict[str, Any]:
     """
-    Filtre de Qualité d'Entrée (FQE) — checklist sur 5 (section 5c de la spec).
-    Retourne le score et le détail de chaque critère.
-    """
-    scd_aligned = (scd > 0 and direction == "BUY") or (scd < 0 and direction == "SELL")
-    volatility_ok = volatility_regime != "compression"
-    zone_ok = (zone_proximity == "demand" and direction == "BUY") or (zone_proximity == "supply" and direction == "SELL")
-
-    criteria = {
-        "scd_coherent": scd_aligned,
-        "volatilite_non_compressee": volatility_ok,
-        "action_prix_confirmee": price_action_confirmed,
-        "zone_interet_touchee": zone_ok,
-        "pas_de_macro_imminente": not macro_event_soon,
-    }
-    score = sum(1 for v in criteria.values() if v)
-    return {"score": score, "criteria": criteria, "valid": score >= 4}
-
-
-def check_invalidation(payload: Dict, position: Dict, zones: List[Dict], volatility: Dict, bias: Dict) -> Optional[str]:
-    """
-    Vérifie les conditions d'invalidation d'une position ouverte (section 7 de la spec).
-    Retourne une chaîne décrivant l'invalidation, ou None si la position reste valide.
-    """
-    direction = position["direction"]
-    entry_zone_price = position.get("zone_reference_price")
-
-    # 1. Cassure nette de la zone de référence (clôture au-delà, pas juste une mèche)
-    last_candle = payload["M15"]["ohlc"][-1]
-    if entry_zone_price is not None:
-        if direction == "BUY" and last_candle["close"] < entry_zone_price:
-            return "Cassure nette de la zone de support ayant justifié l'entrée"
-        if direction == "SELL" and last_candle["close"] > entry_zone_price:
-            return "Cassure nette de la zone de résistance ayant justifié l'entrée"
-
-    # 2. Macro majeure imminente non anticipée
-    if _macro_event_within_buffer(payload.get("evenements_macro_a_venir", []), buffer_minutes=60):
-        return "Publication macro majeure imminente non anticipée"
-
-    # 3. IRV en régime extrême sans structure claire
-    if volatility["irv"] > 2.0 and bias["structure_h4"] == "range":
-        return "IRV en régime extrême (>2.0) sans structure claire"
-
-    # 4. Divergence entre biais H4 et direction du trade
-    if direction == "BUY" and bias["structure_h4"] == "bearish":
-        return "Divergence: structure H4 s'est retournée à la baisse après entrée"
-    if direction == "SELL" and bias["structure_h4"] == "bullish":
-        return "Divergence: structure H4 s'est retournée à la hausse après entrée"
-
-    return None
-
-
-def manage_open_position(payload: Dict, position: Dict, zones: List[Dict], volatility: Dict, bias: Dict) -> Dict:
-    """
-    Gère une position ouverte: vérifie invalidation, SL/TP touché, et sortie partielle à 1R.
-    """
-    invalidation_reason = check_invalidation(payload, position, zones, volatility, bias)
-    if invalidation_reason:
-        return {
-            "decision": "EXIT",
-            "raisonnement": f"Invalidation détectée: {invalidation_reason}",
-        }
-
-    price = payload["prix"]["actuel"]
-    entry = position["entry"]
-    sl = position["sl"]
-    tp = position["tp"]
-    direction = position["direction"]
-    partial_taken = position.get("partial_exit_taken", False)
-
-    if direction == "BUY":
-        r_distance = entry - sl
-        current_r = (price - entry) / r_distance if r_distance != 0 else 0
-    else:
-        r_distance = sl - entry
-        current_r = (entry - price) / r_distance if r_distance != 0 else 0
-
-    if not partial_taken and current_r >= 1.0:
-        return {
-            "decision": "REDUCE",
-            "raisonnement": f"Position atteint 1R ({current_r:.2f}) — sortie partielle de 50%, SL remonté au breakeven",
-            "nouveau_sl": entry,
-            "pourcentage_reduction": 50,
-        }
-
-    return {
-        "decision": "HOLD",
-        "raisonnement": f"Position toujours valide, R actuel = {current_r:.2f}, aucune invalidation détectée",
-    }
-
-
-def evaluate_new_entry(
-    payload: Dict,
-    direction: str,
-    bias: Dict,
-    volatility: Dict,
-    zones: List[Dict],
-) -> Dict:
-    """
-    Évalue une entrée potentielle dans une direction donnée, applique la
-    checklist FQE + le portail de risque (section 6 + section 8).
-    """
-    price = payload["prix"]["actuel"]
-    atr_m15 = payload["M15"].get("atr14") or ind.atr_last(payload["M15"]["ohlc"], period=14) if len(payload["M15"]["ohlc"]) > 14 else volatility["atr_current"]
-
-    zone_proximity = zn.zone_proximity_type(price, zones, volatility["atr_current"], max_distance_factor=0.3)
-    price_action_confirmed = pa.detect_price_action_signal(payload["M15"]["ohlc"], direction)
-    macro_event_soon = _macro_event_within_buffer(payload.get("evenements_macro_a_venir", []))
-
-    scd = ind.scd_score(price, bias["ema50_h4"], bias["ema200_h4"], bias["structure_h4"], zone_proximity)
-
-    fqe = evaluate_fqe(
-        scd=scd,
-        direction=direction,
-        volatility_regime=volatility["regime"],
-        price_action_confirmed=price_action_confirmed,
-        zone_proximity=zone_proximity,
-        macro_event_soon=macro_event_soon,
-    )
-
-    if not fqe["valid"]:
-        return {
-            "decision": "HOLD",
-            "scd": scd,
-            "irv": volatility["irv"],
-            "fqe_score": fqe["score"],
-            "raisonnement": f"FQE insuffisant ({fqe['score']}/5): {fqe['criteria']}",
-        }
-
-    # Construction du trade (SL/TP structurels) à partir de la zone la plus proche
-    nearest = zn.nearest_zone(price, zones)
-    if nearest is None:
-        return {
-            "decision": "HOLD",
-            "scd": scd,
-            "irv": volatility["irv"],
-            "fqe_score": fqe["score"],
-            "raisonnement": "Aucune zone d'intérêt disponible pour structurer SL/TP",
-        }
-
-    buffer_ = 0.3 * volatility["atr_current"]
-    if direction == "BUY":
-        sl = nearest["price"] - buffer_
-        risk_distance = price - sl
-        tp = price + risk_distance * rm.MIN_RISK_REWARD
-    else:
-        sl = nearest["price"] + buffer_
-        risk_distance = sl - price
-        tp = price - risk_distance * rm.MIN_RISK_REWARD
-
-    compte = payload["compte"]
-    daily_loss = payload.get("perte_du_jour_cumulee", 0.0)
-    losing_trades_today = payload.get("nombre_trades_perdants_jour", 0)
-    open_positions = compte.get("positions_ouvertes", [])
-
-    risk_check = rm.full_risk_gate(
-        daily_loss_cumulative=daily_loss,
-        open_positions=open_positions,
-        new_direction=direction,
-        losing_trades_today=losing_trades_today,
-        entry=price,
-        sl=sl,
-        tp=tp,
-    )
-
-    if not risk_check.allowed:
-        return {
-            "decision": "HOLD",
-            "scd": scd,
-            "irv": volatility["irv"],
-            "fqe_score": fqe["score"],
-            "raisonnement": f"Bloqué par le risk manager: {risk_check.reason}",
-        }
-
-    risk_dollars = rm.enforce_min_risk(rm.RISK_PER_TRADE_MIN_DOLLARS)
-    rr = rm.compute_risk_reward(price, sl, tp, direction)
-
-    return {
-        "decision": "ENTER",
-        "direction": direction,
-        "entry": round(price, 2),
-        "sl": round(sl, 2),
-        "tp": round(tp, 2),
-        "risque_dollars": risk_dollars,
-        "rr_vise": rr,
-        "scd": scd,
-        "irv": round(volatility["irv"], 3),
-        "fqe_score": fqe["score"],
-        "zone_reference_price": nearest["price"],
-        "raisonnement": (
-            f"Entrée {direction} validée — FQE {fqe['score']}/5, SCD={scd}, "
-            f"IRV={volatility['irv']:.2f} ({volatility['regime']}), R:R={rr}"
-        ),
-    }
-
-
-def analyze(payload: Dict) -> Dict:
-    """
-    Point d'entrée principal du moteur de décision.
-
-    Si des positions sont ouvertes (payload['compte']['positions_ouvertes']),
-    gère chaque position (invalidation / partial exit / hold).
-
-    Sinon, évalue une entrée potentielle dans la direction suggérée par le biais (SCD).
+    Construit le dossier d'analyse structuré envoyé à Claude.
+    Ne contient QUE les informations calculées et pertinentes — pas les
+    centaines de bougies brutes qui gaspilleraient des tokens.
     """
     bias = compute_bias(payload)
     volatility = compute_volatility_regime(payload)
     zones = compute_zones(payload)
 
-    open_positions = payload["compte"].get("positions_ouvertes", [])
-
-    if open_positions:
-        # Gestion de la première position ouverte (le portail de risque interdit déjà >2)
-        position = open_positions[0]
-        result = manage_open_position(payload, position, zones, volatility, bias)
-        result.setdefault("scd", None)
-        result.setdefault("irv", round(volatility["irv"], 3))
-        return result
-
     price = payload["prix"]["actuel"]
     zone_proximity = zn.zone_proximity_type(price, zones, volatility["atr_current"], max_distance_factor=0.3)
     scd = ind.scd_score(price, bias["ema50_h4"], bias["ema200_h4"], bias["structure_h4"], zone_proximity)
 
-    if scd > 0:
-        return evaluate_new_entry(payload, "BUY", bias, volatility, zones)
-    elif scd < 0:
-        return evaluate_new_entry(payload, "SELL", bias, volatility, zones)
-    else:
+    price_action_buy = pa.detect_price_action_signal(payload["M15"]["ohlc"], "BUY")
+    price_action_sell = pa.detect_price_action_signal(payload["M15"]["ohlc"], "SELL")
+
+    macro_event_soon = _macro_event_within_buffer(payload.get("evenements_macro_a_venir", []))
+
+    zones_with_distance = []
+    for z in zones:
+        zones_with_distance.append({
+            "prix": round(z["price"], 2),
+            "type": z["type"],
+            "touches": z["touches"],
+            "distance_atr": round(abs(z["price"] - price) / volatility["atr_current"], 2),
+        })
+
+    compte = payload["compte"]
+    perte_du_jour = payload.get("perte_du_jour_cumulee", 0.0)
+    trades_perdants = payload.get("nombre_trades_perdants_jour", 0)
+
+    dossier = {
+        "moment": payload.get("timestamp"),
+        "prix": {
+            "actuel": round(price, 2),
+            "bid": payload["prix"].get("bid"),
+            "ask": payload["prix"].get("ask"),
+            "spread": payload["prix"].get("spread"),
+        },
+        "biais_directionnel": {
+            "structure_h4": bias["structure_h4"],
+            "prix_vs_ema50_h4": "au-dessus" if price > bias["ema50_h4"] else "en-dessous",
+            "prix_vs_ema200_h4": "au-dessus" if price > bias["ema200_h4"] else "en-dessous",
+            "ema50_h4": round(bias["ema50_h4"], 2),
+            "ema200_h4": round(bias["ema200_h4"], 2),
+            "scd": scd,  # -3 à +3
+        },
+        "volatilite": {
+            "atr_h1_courant": round(volatility["atr_current"], 3),
+            "atr_h1_moyenne_20": round(volatility["atr_avg20"], 3),
+            "irv": round(volatility["irv"], 3),
+            "regime": volatility["regime"],  # "compression" | "normal" | "expansion"
+        },
+        "zones_interet": zones_with_distance,
+        "zone_proximite_actuelle": zone_proximity,  # "demand" | "supply" | None
+        "action_prix_m15": {
+            "signal_haussier_present": price_action_buy,
+            "signal_baissier_present": price_action_sell,
+        },
+        "macro": {
+            "evenement_majeur_imminent": macro_event_soon,
+            "evenements_a_venir": payload.get("evenements_macro_a_venir", []),
+        },
+        "compte": {
+            "solde": compte.get("solde"),
+            "equite": compte.get("equite"),
+            "marge_disponible": compte.get("marge_disponible"),
+            "positions_ouvertes": compte.get("positions_ouvertes", []),
+        },
+        "budget_risque": {
+            "perte_du_jour_cumulee": perte_du_jour,
+            "perte_max_journaliere_restante": max(rm.DAILY_LOSS_MAX_DOLLARS - perte_du_jour, 0),
+            "trades_perdants_du_jour": trades_perdants,
+            "trades_perdants_restants": max(rm.MAX_LOSING_TRADES_PER_DAY - trades_perdants, 0),
+            "positions_ouvertes_max": rm.MAX_OPEN_POSITIONS,
+            "positions_ouvertes_actuelles": len(compte.get("positions_ouvertes", [])),
+        },
+    }
+    return dossier
+
+
+# --- Garde-fous : validation de la décision de Claude par le risk manager ---
+
+def _forced_hold(reason: str, claude_decision: Dict[str, Any]) -> Dict[str, Any]:
+    """Décision forcée en HOLD par le risk manager, avec conservation du contexte Claude."""
+    return {
+        "decision": "HOLD",
+        "direction": None,
+        "entry": None,
+        "sl": None,
+        "tp": None,
+        "risque_dollars": None,
+        "rr_vise": None,
+        "raisonnement": f"[Forcé en HOLD par risk manager: {reason}] — Claude avait proposé: {claude_decision.get('decision')} ({claude_decision.get('raisonnement', '')[:200]})",
+        "confiance": claude_decision.get("confiance"),
+        "risques_identifies": claude_decision.get("risques_identifies", []),
+    }
+
+
+def apply_risk_guardrails(
+    claude_decision: Dict[str, Any],
+    payload: Dict[str, Any],
+    dossier: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Applique tous les garde-fous du risk manager sur la décision de Claude.
+    Retourne soit la décision de Claude (validée et complétée), soit un HOLD forcé.
+    """
+    decision_type = claude_decision["decision"]
+    price = payload["prix"]["actuel"]
+
+    # HOLD, EXIT, REDUCE passent tels quels — le risk manager ne bloque QUE les entrées
+    if decision_type in ("HOLD", "EXIT"):
+        return {
+            "decision": decision_type,
+            "direction": None,
+            "entry": None,
+            "sl": None,
+            "tp": None,
+            "risque_dollars": None,
+            "rr_vise": None,
+            "raisonnement": claude_decision["raisonnement"],
+            "confiance": claude_decision["confiance"],
+            "risques_identifies": claude_decision.get("risques_identifies", []),
+        }
+
+    if decision_type == "REDUCE":
+        return {
+            "decision": "REDUCE",
+            "direction": None,
+            "entry": None,
+            "sl": None,
+            "tp": None,
+            "risque_dollars": None,
+            "rr_vise": None,
+            "nouveau_sl": claude_decision.get("sl_propose"),
+            "pourcentage_reduction": 50,  # fixé par la spec
+            "raisonnement": claude_decision["raisonnement"],
+            "confiance": claude_decision["confiance"],
+            "risques_identifies": claude_decision.get("risques_identifies", []),
+        }
+
+    # ENTER — vérifications strictes
+    if decision_type == "ENTER":
+        direction = claude_decision.get("direction")
+        sl = claude_decision.get("sl_propose")
+        tp = claude_decision.get("tp_propose")
+
+        if direction not in ("BUY", "SELL") or sl is None or tp is None:
+            return _forced_hold("ENTER incomplet (direction/sl/tp manquants)", claude_decision)
+
+        # Portail de risque complet
+        compte = payload["compte"]
+        risk_check = rm.full_risk_gate(
+            daily_loss_cumulative=payload.get("perte_du_jour_cumulee", 0.0),
+            open_positions=compte.get("positions_ouvertes", []),
+            new_direction=direction,
+            losing_trades_today=payload.get("nombre_trades_perdants_jour", 0),
+            entry=price,
+            sl=sl,
+            tp=tp,
+        )
+        if not risk_check.allowed:
+            return _forced_hold(risk_check.reason, claude_decision)
+
+        # Trouver la zone de référence la plus proche pour tracer l'invalidation
+        zones = compute_zones(payload)
+        nearest = zn.nearest_zone(price, zones)
+        zone_reference_price = nearest["price"] if nearest else None
+
+        risk_dollars = rm.enforce_min_risk(rm.RISK_PER_TRADE_MIN_DOLLARS)
+        rr = rm.compute_risk_reward(price, sl, tp, direction)
+
+        return {
+            "decision": "ENTER",
+            "direction": direction,
+            "entry": round(price, 2),
+            "sl": round(sl, 2),
+            "tp": round(tp, 2),
+            "risque_dollars": risk_dollars,
+            "rr_vise": rr,
+            "zone_reference_price": zone_reference_price,
+            "raisonnement": claude_decision["raisonnement"],
+            "confiance": claude_decision["confiance"],
+            "risques_identifies": claude_decision.get("risques_identifies", []),
+        }
+
+    # Type de décision inconnu — sécurité
+    return _forced_hold(f"type de décision inconnu: {decision_type}", claude_decision)
+
+
+# --- Point d'entrée principal ---
+
+def analyze(payload: Dict[str, Any], client=None) -> Dict[str, Any]:
+    """
+    Point d'entrée principal du moteur.
+    1. Construit le dossier d'analyse
+    2. Appelle Claude via claude_advisor
+    3. Valide la décision de Claude via le risk manager
+    4. Retourne la décision finale
+
+    `client` optionnel (httpx.Client) permet l'injection pour les tests.
+    """
+    try:
+        dossier = build_dossier(payload)
+    except Exception as exc:
+        logger.exception("Erreur lors de la construction du dossier d'analyse")
         return {
             "decision": "HOLD",
-            "scd": scd,
-            "irv": round(volatility["irv"], 3),
-            "fqe_score": None,
-            "raisonnement": "SCD neutre (0) — aucun biais directionnel suffisant pour envisager une entrée",
+            "direction": None,
+            "entry": None, "sl": None, "tp": None,
+            "risque_dollars": None, "rr_vise": None,
+            "raisonnement": f"[Erreur technique: impossible de construire le dossier — {exc}]",
+            "confiance": "basse",
+            "risques_identifies": [f"Erreur build_dossier: {type(exc).__name__}"],
         }
+
+    claude_decision = claude_advisor.ask_claude(dossier, client=client)
+    final_decision = apply_risk_guardrails(claude_decision, payload, dossier)
+
+    # Ajouter les métadonnées de contexte pour le journal (mais ne pas polluer l'API)
+    final_decision["scd"] = dossier["biais_directionnel"]["scd"]
+    final_decision["irv"] = dossier["volatilite"]["irv"]
+    final_decision["fqe_score"] = None  # calculé plus haut par Claude si utilisé
+
+    return final_decision
