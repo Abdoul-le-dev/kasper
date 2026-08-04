@@ -1,17 +1,20 @@
 """
 decision_engine.py
 
-Architecture B pure — Claude est le décideur, ce module l'assiste.
+Assemble le dossier d'analyse COMPLET (payload maximal) envoyé à Claude:
+- Bougies brutes multi-timeframes
+- Tous les indicateurs calculés (SCD, IRV, EMA, ATR, RSI, Bollinger)
+- Zones support/résistance
+- Fibonacci du dernier swing
+- VWAP de la session
+- Contexte de session (Asie/Londres/NY/overlap)
+- DXY (Dollar Index) actuel + variations
+- Événements macro à venir (24h)
+- Historique des 10 dernières décisions Claude
+- État du compte + budget de risque restant
 
-Flux à chaque appel:
-1. Calculer tous les indicateurs (SCD, IRV, FQE, zones, action de prix, etc.)
-2. Assembler un "dossier d'analyse" structuré et lisible par Claude
-3. Envoyer le dossier à Claude via claude_advisor.ask_claude
-4. Faire valider la décision de Claude par le risk manager (garde-fous durs)
-5. Retourner la décision finale au format attendu par l'API
-
-Le risk manager est AU-DESSUS de Claude — il peut refuser ou modifier sa
-décision. Claude propose, le code Python dispose.
+Puis fait valider la décision de Claude par le risk manager (garde-fous durs
+conservés).
 """
 
 import logging
@@ -22,23 +25,18 @@ from . import zones as zn
 from . import price_action as pa
 from . import risk_manager as rm
 from . import claude_advisor
+from . import session_context
+from . import dxy_provider
+from . import macro_calendar
+from . import advanced_indicators as adv
+from . import history_provider
 
 logger = logging.getLogger("trading_engine.decision_engine")
 
-MACRO_EVENT_BUFFER_MINUTES = 60
 
-
-# --- Calculs de contexte (inchangés depuis l'ancienne version) ---
-
-def _macro_event_within_buffer(evenements_macro: List[Dict], buffer_minutes: int = MACRO_EVENT_BUFFER_MINUTES) -> bool:
-    for event in evenements_macro:
-        if event.get("impact") == "high" and event.get("minutes_avant", 9999) <= buffer_minutes:
-            return True
-    return False
-
+# --- Calculs de contexte ---
 
 def compute_bias(payload: Dict) -> Dict:
-    """Étape A — Biais directionnel (D1/H4)."""
     h4 = payload["H4"]
     ohlc_h4 = h4["ohlc"]
     ema50_h4 = h4.get("ema50") or ind.ema_last([c["close"] for c in ohlc_h4], 50)
@@ -49,7 +47,6 @@ def compute_bias(payload: Dict) -> Dict:
 
 
 def compute_volatility_regime(payload: Dict) -> Dict:
-    """Étape B — Régime de volatilité (IRV) basé sur ATR H1."""
     h1 = payload["H1"]
     atr_current = h1.get("atr14")
     atr_avg20 = h1.get("atr14_moy20")
@@ -63,17 +60,32 @@ def compute_volatility_regime(payload: Dict) -> Dict:
 
 
 def compute_zones(payload: Dict) -> List[Dict]:
-    """Étape C — Zones d'intérêt à partir de D1/H4."""
-    return zn.identify_zones(payload["D1"]["ohlc"], payload["H4"]["ohlc"], max_zones=4)
+    return zn.identify_zones(payload["D1"]["ohlc"], payload["H4"]["ohlc"], max_zones=6)
 
 
-# --- Assemblage du dossier d'analyse pour Claude ---
+# --- Utilitaires pour alléger les bougies avant envoi ---
+
+def _round_ohlc(ohlc: List[Dict], decimals: int = 3, max_candles: Optional[int] = None) -> List[Dict]:
+    """Arrondit les OHLC pour réduire le poids en tokens, garde les N dernières bougies."""
+    if max_candles:
+        ohlc = ohlc[-max_candles:]
+    return [
+        {
+            "o": round(c["open"], decimals),
+            "h": round(c["high"], decimals),
+            "l": round(c["low"], decimals),
+            "c": round(c["close"], decimals),
+        }
+        for c in ohlc
+    ]
+
+
+# --- Assemblage du dossier maximal ---
 
 def build_dossier(payload: Dict) -> Dict[str, Any]:
     """
-    Construit le dossier d'analyse structuré envoyé à Claude.
-    Ne contient QUE les informations calculées et pertinentes — pas les
-    centaines de bougies brutes qui gaspilleraient des tokens.
+    Construit le dossier d'analyse ENRICHI envoyé à Claude.
+    Volume cible: ~10-15k tokens (bougies brutes + tous les contextes).
     """
     bias = compute_bias(payload)
     volatility = compute_volatility_regime(payload)
@@ -86,52 +98,105 @@ def build_dossier(payload: Dict) -> Dict[str, Any]:
     price_action_buy = pa.detect_price_action_signal(payload["M15"]["ohlc"], "BUY")
     price_action_sell = pa.detect_price_action_signal(payload["M15"]["ohlc"], "SELL")
 
-    macro_event_soon = _macro_event_within_buffer(payload.get("evenements_macro_a_venir", []))
+    # Fibonacci sur H1 (dernier swing)
+    fib = adv.fibonacci_levels(payload["H1"]["ohlc"], lookback=50)
 
-    zones_with_distance = []
-    for z in zones:
-        zones_with_distance.append({
-            "prix": round(z["price"], 2),
+    # VWAP session sur M15
+    vwap_info = adv.vwap_session(payload["M15"]["ohlc"], session_length_candles=32)
+
+    # Session actuelle
+    session = session_context.get_session_info()
+
+    # DXY (peut échouer, on capture proprement)
+    try:
+        dxy = dxy_provider.get_dxy_context()
+    except Exception as exc:
+        logger.warning("DXY error: %s", exc)
+        dxy = {"available": False, "reason": str(exc)}
+
+    # Macro à venir
+    try:
+        macro_events = macro_calendar.get_upcoming_events(hours_ahead=24)
+    except Exception as exc:
+        logger.warning("Macro calendar error: %s", exc)
+        macro_events = []
+
+    # Historique des 10 dernières décisions
+    try:
+        history = history_provider.get_recent_decisions_summary(n=10)
+        history_counts = history_provider.count_recent_decisions_by_type(n=10)
+    except Exception as exc:
+        logger.warning("History provider error: %s", exc)
+        history = []
+        history_counts = {}
+
+    # Zones avec distance ATR
+    zones_with_distance = [
+        {
+            "prix": round(z["price"], 3),
             "type": z["type"],
             "touches": z["touches"],
             "distance_atr": round(abs(z["price"] - price) / volatility["atr_current"], 2),
-        })
+        }
+        for z in zones
+    ]
 
+    # Compte
     compte = payload["compte"]
     perte_du_jour = payload.get("perte_du_jour_cumulee", 0.0)
     trades_perdants = payload.get("nombre_trades_perdants_jour", 0)
 
+    # RSI H1 (calculé si non fourni)
+    h1_ohlc = payload["H1"]["ohlc"]
+    try:
+        rsi_h1 = ind.rsi([c["close"] for c in h1_ohlc], period=14)
+    except Exception:
+        rsi_h1 = None
+
     dossier = {
         "moment": payload.get("timestamp"),
+        "session": session,
         "prix": {
-            "actuel": round(price, 2),
+            "actuel": round(price, 3),
             "bid": payload["prix"].get("bid"),
             "ask": payload["prix"].get("ask"),
             "spread": payload["prix"].get("spread"),
         },
-        "biais_directionnel": {
+        "bougies_brutes": {
+            "D1": _round_ohlc(payload["D1"]["ohlc"], max_candles=100),
+            "H4": _round_ohlc(payload["H4"]["ohlc"], max_candles=100),
+            "H1": _round_ohlc(payload["H1"]["ohlc"], max_candles=60),
+            "M15": _round_ohlc(payload["M15"]["ohlc"], max_candles=60),
+            "M5": _round_ohlc(payload["M5"]["ohlc"], max_candles=40),
+        },
+        "indicateurs_calcules": {
+            "ema50_h4": round(bias["ema50_h4"], 3),
+            "ema200_h4": round(bias["ema200_h4"], 3),
             "structure_h4": bias["structure_h4"],
             "prix_vs_ema50_h4": "au-dessus" if price > bias["ema50_h4"] else "en-dessous",
             "prix_vs_ema200_h4": "au-dessus" if price > bias["ema200_h4"] else "en-dessous",
-            "ema50_h4": round(bias["ema50_h4"], 2),
-            "ema200_h4": round(bias["ema200_h4"], 2),
-            "scd": scd,  # -3 à +3
-        },
-        "volatilite": {
+            "scd": scd,
             "atr_h1_courant": round(volatility["atr_current"], 3),
             "atr_h1_moyenne_20": round(volatility["atr_avg20"], 3),
             "irv": round(volatility["irv"], 3),
-            "regime": volatility["regime"],  # "compression" | "normal" | "expansion"
+            "regime_volatilite": volatility["regime"],
+            "rsi_h1": round(rsi_h1, 2) if rsi_h1 is not None else None,
         },
         "zones_interet": zones_with_distance,
-        "zone_proximite_actuelle": zone_proximity,  # "demand" | "supply" | None
+        "zone_proximite_actuelle": zone_proximity,
+        "fibonacci": fib,
+        "vwap_session_m15": vwap_info,
         "action_prix_m15": {
             "signal_haussier_present": price_action_buy,
             "signal_baissier_present": price_action_sell,
         },
+        "dxy": dxy,
         "macro": {
-            "evenement_majeur_imminent": macro_event_soon,
-            "evenements_a_venir": payload.get("evenements_macro_a_venir", []),
+            "evenements_a_venir_24h": macro_events,
+            "evenement_high_impact_dans_60min": any(
+                e.get("impact") == "high" and e.get("minutes_avant", 9999) <= 60
+                for e in macro_events
+            ),
         },
         "compte": {
             "solde": compte.get("solde"),
@@ -147,14 +212,17 @@ def build_dossier(payload: Dict) -> Dict[str, Any]:
             "positions_ouvertes_max": rm.MAX_OPEN_POSITIONS,
             "positions_ouvertes_actuelles": len(compte.get("positions_ouvertes", [])),
         },
+        "historique_decisions_recentes": {
+            "dernieres_10_decisions": history,
+            "compte_par_type": history_counts,
+        },
     }
     return dossier
 
 
-# --- Garde-fous : validation de la décision de Claude par le risk manager ---
+# --- Garde-fous du risk manager ---
 
 def _forced_hold(reason: str, claude_decision: Dict[str, Any]) -> Dict[str, Any]:
-    """Décision forcée en HOLD par le risk manager, avec conservation du contexte Claude."""
     return {
         "decision": "HOLD",
         "direction": None,
@@ -174,14 +242,9 @@ def apply_risk_guardrails(
     payload: Dict[str, Any],
     dossier: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Applique tous les garde-fous du risk manager sur la décision de Claude.
-    Retourne soit la décision de Claude (validée et complétée), soit un HOLD forcé.
-    """
     decision_type = claude_decision["decision"]
     price = payload["prix"]["actuel"]
 
-    # HOLD, EXIT, REDUCE passent tels quels — le risk manager ne bloque QUE les entrées
     if decision_type in ("HOLD", "EXIT"):
         return {
             "decision": decision_type,
@@ -206,13 +269,12 @@ def apply_risk_guardrails(
             "risque_dollars": None,
             "rr_vise": None,
             "nouveau_sl": claude_decision.get("sl_propose"),
-            "pourcentage_reduction": 50,  # fixé par la spec
+            "pourcentage_reduction": 50,
             "raisonnement": claude_decision["raisonnement"],
             "confiance": claude_decision["confiance"],
             "risques_identifies": claude_decision.get("risques_identifies", []),
         }
 
-    # ENTER — vérifications strictes
     if decision_type == "ENTER":
         direction = claude_decision.get("direction")
         sl = claude_decision.get("sl_propose")
@@ -221,7 +283,6 @@ def apply_risk_guardrails(
         if direction not in ("BUY", "SELL") or sl is None or tp is None:
             return _forced_hold("ENTER incomplet (direction/sl/tp manquants)", claude_decision)
 
-        # Portail de risque complet
         compte = payload["compte"]
         risk_check = rm.full_risk_gate(
             daily_loss_cumulative=payload.get("perte_du_jour_cumulee", 0.0),
@@ -235,7 +296,6 @@ def apply_risk_guardrails(
         if not risk_check.allowed:
             return _forced_hold(risk_check.reason, claude_decision)
 
-        # Trouver la zone de référence la plus proche pour tracer l'invalidation
         zones = compute_zones(payload)
         nearest = zn.nearest_zone(price, zones)
         zone_reference_price = nearest["price"] if nearest else None
@@ -257,22 +317,10 @@ def apply_risk_guardrails(
             "risques_identifies": claude_decision.get("risques_identifies", []),
         }
 
-    # Type de décision inconnu — sécurité
     return _forced_hold(f"type de décision inconnu: {decision_type}", claude_decision)
 
 
-# --- Point d'entrée principal ---
-
 def analyze(payload: Dict[str, Any], client=None) -> Dict[str, Any]:
-    """
-    Point d'entrée principal du moteur.
-    1. Construit le dossier d'analyse
-    2. Appelle Claude via claude_advisor
-    3. Valide la décision de Claude via le risk manager
-    4. Retourne la décision finale
-
-    `client` optionnel (httpx.Client) permet l'injection pour les tests.
-    """
     try:
         dossier = build_dossier(payload)
     except Exception as exc:
@@ -290,9 +338,9 @@ def analyze(payload: Dict[str, Any], client=None) -> Dict[str, Any]:
     claude_decision = claude_advisor.ask_claude(dossier, client=client)
     final_decision = apply_risk_guardrails(claude_decision, payload, dossier)
 
-    # Ajouter les métadonnées de contexte pour le journal (mais ne pas polluer l'API)
-    final_decision["scd"] = dossier["biais_directionnel"]["scd"]
-    final_decision["irv"] = dossier["volatilite"]["irv"]
-    final_decision["fqe_score"] = None  # calculé plus haut par Claude si utilisé
+    final_decision["scd"] = dossier["indicateurs_calcules"]["scd"]
+    final_decision["irv"] = dossier["indicateurs_calcules"]["irv"]
+    final_decision["fqe_score"] = None
+    final_decision["session"] = dossier["session"]["session_label"]
 
     return final_decision

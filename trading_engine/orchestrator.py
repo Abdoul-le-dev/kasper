@@ -23,7 +23,6 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 
 import httpx
-import schedule
 
 from . import metaapi_connector as broker
 from . import journal
@@ -245,20 +244,133 @@ def avg_spread_gap_threshold(gap: float, threshold: float = 3.0) -> bool:
     return gap > threshold
 
 
+# --- Récap consolidé toutes les 30 min ---
+
+def send_periodic_recap() -> None:
+    """
+    Envoie sur Telegram un résumé consolidé des cycles récents (30 dernières min).
+    Utile quand HOLD n'est pas notifié individuellement mais qu'on veut voir
+    l'activité du système régulièrement.
+    """
+    try:
+        from . import history_provider
+        from datetime import datetime, timezone, timedelta
+
+        recent = history_provider.get_recent_decisions_summary(n=10)
+        if not recent:
+            return
+
+        # Filtrer les décisions des 30 dernières minutes
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(minutes=32)
+        recent_30min = []
+        for d in recent:
+            ts = d.get("timestamp")
+            if not ts:
+                continue
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if dt >= cutoff:
+                    recent_30min.append(d)
+            except (ValueError, AttributeError):
+                continue
+
+        counts = {"HOLD": 0, "ENTER": 0, "EXIT": 0, "REDUCE": 0}
+        for d in recent_30min:
+            t = d.get("decision")
+            if t in counts:
+                counts[t] += 1
+
+        session_info = _current_session_info()
+        recap_text = (
+            f"📊 *Récap 30 min* — session {session_info}\n"
+            f"Cycles écoulés : {len(recent_30min)}\n"
+            f"HOLD: {counts['HOLD']} | ENTER: {counts['ENTER']} | "
+            f"EXIT: {counts['EXIT']} | REDUCE: {counts['REDUCE']}"
+        )
+        if recent_30min:
+            last = recent_30min[-1]
+            recap_text += f"\n\n_Dernière décision : {last.get('decision')} ({last.get('confiance', '?')})_"
+
+        tg.send_message(recap_text)
+    except Exception:
+        logger.exception("Erreur lors du récap Telegram (non bloquant)")
+
+
+def _current_session_info() -> str:
+    """Chaîne descriptive de la session actuelle pour le récap."""
+    try:
+        from . import session_context
+        info = session_context.get_session_info()
+        return info["session_label"]
+    except Exception:
+        return "inconnue"
+
+
+# --- Cadence adaptative ---
+
+def get_current_cycle_interval_minutes() -> int:
+    """Retourne l'intervalle du prochain cycle selon la session."""
+    try:
+        from . import session_context
+        return session_context.get_session_info()["cycle_minutes"]
+    except Exception:
+        return 25  # défaut sécurisé
+
+
+def _adaptive_cycle_scheduler() -> None:
+    """
+    Scheduler personnalisé qui adapte l'intervalle selon la session.
+    Session US ouverte → 5 min, hors → 25 min, weekend → 30 min.
+    """
+    last_cycle_time = time.time()
+    last_recap_time = time.time()
+
+    # Premier cycle immédiat
+    try:
+        run_cycle(declencheur="cyclique_start")
+    except Exception:
+        logger.exception("Erreur au premier cycle (poursuite)")
+
+    while True:
+        try:
+            now = time.time()
+
+            # Cycle principal selon session
+            interval_seconds = get_current_cycle_interval_minutes() * 60
+            if now - last_cycle_time >= interval_seconds:
+                try:
+                    run_cycle(declencheur="cyclique_adaptatif")
+                except Exception:
+                    logger.exception("Erreur pendant run_cycle (poursuite)")
+                last_cycle_time = now
+
+            # Récap consolidé toutes les 30 min
+            if now - last_recap_time >= 1800:  # 30 min
+                send_periodic_recap()
+                last_recap_time = now
+
+            # Surveillance légère toutes les 60s
+            monitor_urgent_conditions()
+
+            time.sleep(60)
+        except KeyboardInterrupt:
+            logger.info("Arrêt manuel de l'orchestrateur")
+            break
+        except Exception:
+            logger.exception("Erreur dans la boucle adaptative (retry dans 60s)")
+            time.sleep(60)
+
+
 # --- Boucle principale ---
 
 def main() -> None:
-    logger.info("Démarrage de l'orchestrateur — cycle toutes les 30 min, surveillance toutes les 60s")
-
-    schedule.every(30).minutes.do(run_cycle, declencheur="cyclique_30min")
-    schedule.every(60).seconds.do(monitor_urgent_conditions)
-
-    # Premier cycle immédiat au démarrage
-    run_cycle(declencheur="cyclique_30min")
-
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+    logger.info(
+        "Démarrage orchestrateur — cadence adaptative "
+        "(5 min session US, 25 min hors, 30 min weekend). "
+        "Récap Telegram toutes les 30 min. Surveillance toutes les 60s."
+    )
+    _adaptive_cycle_scheduler()
 
 
 if __name__ == "__main__":

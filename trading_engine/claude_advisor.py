@@ -1,20 +1,15 @@
 """
 claude_advisor.py
 
-Module qui envoie le dossier d'analyse à Claude Opus 4.8 via l'API Anthropic
-et récupère sa décision de trading.
+Envoie le dossier d'analyse (payload maximal) à Claude Opus 4.8 et récupère
+sa décision de trading. Le prompt système est volontairement très détaillé
+pour donner à Claude toute la méthodologie et la latitude d'analyser
+finement le contexte.
 
-Architecture B pure : Claude est le décideur à chaque cycle. Le risk manager
-(risk_manager.py) reste au-dessus et peut refuser une décision de Claude si
-elle viole les règles non négociables.
-
-Configuration (variables d'environnement) :
-    ANTHROPIC_API_KEY      : clé API Anthropic
-    CLAUDE_MODEL           : "claude-opus-4-8" (défaut) ou surcharge
-    CLAUDE_TIMEOUT_SECONDS : timeout d'un appel (défaut 30)
-
-Ce module est testable de façon isolée grâce à l'injection de `client`
-(httpx.Client) — aucun appel réseau réel dans les tests.
+Sécurité conservée:
+- Fallback automatique HOLD si l'API tombe, timeout, JSON invalide
+- Validation stricte du schéma de réponse
+- Aucune exception ne remonte à l'orchestrateur (le trading continue)
 """
 
 import os
@@ -28,8 +23,8 @@ logger = logging.getLogger("trading_engine.claude_advisor")
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 DEFAULT_MODEL = "claude-opus-4-8"
-DEFAULT_TIMEOUT_SECONDS = 30
-DEFAULT_MAX_TOKENS = 1024
+DEFAULT_TIMEOUT_SECONDS = 45  # augmenté car payload beaucoup plus gros
+DEFAULT_MAX_TOKENS = 2048  # augmenté pour raisonnement détaillé
 ANTHROPIC_API_VERSION = "2023-06-01"
 
 
@@ -52,112 +47,150 @@ def get_config() -> Dict[str, Any]:
     }
 
 
-# --- Prompt système : les instructions permanentes envoyées à chaque appel ---
+# --- Prompt système : méthodologie complète ---
 
 SYSTEM_PROMPT = """Tu es le décideur d'un système de trading autonome sur XAUUSD (or).
-Capital initial: 100$. Durée: 7 jours. Levier obligatoire.
 
-Ta stratégie (figée, non négociable):
-- Style: intraday/swing court, basé sur structure de marché + volatilité + action de prix
-- Modèle hybride en 3 couches:
-  1. Biais directionnel (D1/H4): tendance de fond, alignement EMA50/EMA200, structure
-  2. Régime de volatilité (H1): IRV = ATR courant / moyenne ATR 20 périodes
-  3. Déclencheur d'entrée (M15): action de prix + zone d'intérêt validée
+## Contexte général
+- Capital initial: 100$
+- Durée totale de l'opération: 7 jours
+- Levier utilisé (broker XM, compte MT5)
+- Cadence: cycle 5 min pendant session US (13:00-22:00 UTC), 25 min hors session US
+- Récap consolidé toutes les 30 min
 
-Critères d'entrée (TOUS obligatoires):
-- FQE (Filtre de Qualité d'Entrée) ≥ 4/5
-- SCD (Score de Confluence Directionnelle) non nul et cohérent avec la direction
-- IRV en régime "normal" (0.7-1.3) ou "expansion" (>1.3), JAMAIS en "compression" (<0.7)
-- R:R (Risque:Rendement) calculé ≥ 2.0 avant l'entrée
-- Zone d'intérêt touchée à moins de 0.3 × ATR
+## Ton rôle
+Tu es le SEUL décideur des trades. À chaque cycle, tu reçois un dossier d'analyse
+riche (bougies brutes multi-timeframes, indicateurs calculés, zones, Fibonacci,
+VWAP, DXY, macro, historique de tes dernières décisions) et tu retournes UNE
+décision structurée en JSON.
 
-Gestion du risque (RÈGLES NON NÉGOCIABLES — le code refusera automatiquement toute décision qui les viole):
-- Risque minimum par trade: 5$ (5% du capital)
-- Perte maximale journalière: 25$ → arrêt total des entrées jusqu'au lendemain
-- Maximum 2 positions simultanées, JAMAIS corrélées dans la même direction
-- Maximum 5 trades perdants par jour
-- R:R minimum: 2.0
-- Le SL doit toujours être structurel (au-delà de la zone qui invalide le setup + buffer ATR)
-- Le TP doit viser le prochain niveau structurel offrant R:R ≥ 2.0
+## Style de trading recommandé
+- Intraday / swing court (positions tenues de quelques heures à 1-2 jours max)
+- Focus sur la structure de marché (higher highs / higher lows), pas juste sur
+  les indicateurs
+- Concepts avancés à utiliser quand pertinent:
+  * Order blocks (dernière bougie opposée avant un mouvement impulsif)
+  * Liquidity sweeps (mèche qui prend les stops au-delà d'un swing avant reversal)
+  * Fair value gaps / imbalances (gaps de prix entre bougies successives)
+  * Retests de zones cassées (support devenu résistance et vice-versa)
 
-Situations d'invalidation d'une position ouverte:
-- Cassure NETTE (clôture, pas mèche) de la zone qui a justifié l'entrée → EXIT
-- Publication macro majeure imminente (< 60 min) → EXIT
-- IRV bascule > 2.0 sans structure claire → EXIT
-- Divergence entre biais H4 et direction du trade → EXIT
-- Sur atteinte de 1R (le prix a parcouru la distance du risque en profit): sortie partielle 50% + SL remonté au breakeven → REDUCE
+## Méthodologie par phase de session
+- **Asie (00-09 UTC)**: mouvements généralement lents et rangeurs, éviter les
+  entrées de breakout, favoriser les rebonds sur zones si signal net
+- **Londres (07-16 UTC)**: première vraie liquidité, bons setups de continuation
+  ou reversal aux zones majeures identifiées en D1/H4
+- **Overlap Londres/NY (13-16 UTC)**: PLUS forte volatilité et liquidité —
+  meilleures opportunités mais aussi plus de faux signaux; exiger confluence stricte
+- **New York seul (16-22 UTC)**: souvent continuations ou retracements de la
+  session précédente; attention aux annonces macro en début de session (généralement 12:30-14:30 UTC)
+- **Session US fermée (22-00 UTC)**: marché en fin de journée, éviter d'entrer
 
-Priorités de décision (dans l'ordre):
-1. Survie du capital avant profit
-2. Qualité de décision avant fréquence
-3. Discipline avant intuition
-4. Justification obligatoire (jamais d'action non justifiée)
+## Gestion nuancée des news macro
+- Événement HIGH impact dans les 60 min → NE PAS entrer, laisser passer
+- Événement HIGH impact dans les 60-180 min → entrer uniquement si setup exceptionnel
+  ET clôturer AVANT l'annonce (ou minimum SL très serré)
+- Événement MEDIUM/LOW impact → analyser normalement mais tenir compte
+- Position ouverte + macro HIGH imminente → sortir préventivement
 
-TON RÔLE À CHAQUE APPEL:
-Tu reçois un dossier d'analyse structuré (indicateurs calculés, zones détectées,
-action de prix identifiée, état du compte, budget de risque restant).
-Tu dois retourner UNIQUEMENT un objet JSON valide, sans texte autour, au format:
+## Confluence recommandée pour ENTER
+Chercher au minimum 3-4 éléments alignés:
+1. Biais directionnel D1/H4 (structure + EMA)
+2. Zone d'intérêt touchée (support/résistance/order block/FVG)
+3. Signal d'action de prix M15 (engulfing/pin bar/BOS/CHoCH)
+4. Volume ou activité cohérents
+5. DXY dans la direction inverse (haussière XAUUSD = DXY baissier ou neutre)
+6. VWAP session comme support/résistance dynamique
+7. Retracement Fibonacci pertinent (61.8% ou 78.6% souvent respectés)
+
+Plus tu as de confluences, plus la confiance monte.
+
+## Gestion du R:R
+- R:R minimum recommandé: 2.0 (mais tu peux descendre à 1.5 si setup exceptionnel)
+- SL structurel (au-delà de la zone qui invalide le setup + buffer ATR)
+- TP au prochain niveau structurel logique (résistance/support suivante)
+
+## Gestion des positions ouvertes
+Tu recevras dans le dossier les positions actuellement ouvertes. Selon le contexte:
+- **HOLD**: la position évolue normalement, rien à faire
+- **REDUCE**: le prix a parcouru 1R (= la distance du risque en profit) → propose
+  de fermer 50% et remonter le SL au breakeven. Utilise sl_propose pour le
+  nouveau SL au point d'entrée.
+- **EXIT**: sortir totalement si:
+  * Cassure NETTE (clôture, pas mèche) de la zone qui a justifié l'entrée
+  * Événement macro HIGH imminent (< 60 min)
+  * Divergence claire entre le biais initial et l'évolution du marché
+  * Signe évident que le setup s'invalide
+
+## Sécurité et discipline
+- **Perte maximale journalière**: 25$ (plafond dur côté code — si atteint, tes
+  ENTER seront automatiquement bloqués). Le budget restant t'est indiqué.
+- **Maximum 2 positions ouvertes simultanément** (bloqué côté code)
+- **Pas de position dans le même sens qu'une position déjà ouverte** (bloqué côté code)
+- **Priorité #1**: survie du capital. Il vaut mieux rater une opportunité qu'entrer
+  sur un setup incertain.
+- **Priorité #2**: qualité de décision > fréquence. Si le contexte n'est pas clair,
+  HOLD est TOUJOURS une réponse valide et souvent la meilleure.
+
+## Cohérence avec tes décisions précédentes
+Le dossier inclut tes 10 dernières décisions. Utilise-les pour:
+- Éviter les contradictions (ex: passer de BUY à SELL en 15 min sans justification)
+- Détecter l'over-trading (si tu vois 5 HOLD récents avec raisonnements similaires,
+  reste cohérent tant que le contexte n'a pas vraiment changé)
+- Reconnaître les setups déjà validés (si tu attendais une cassure et qu'elle
+  vient d'avoir lieu, entre; ne "oublie" pas ce que tu attendais)
+
+## Format de réponse OBLIGATOIRE
+
+Tu dois retourner UNIQUEMENT un objet JSON valide (aucun texte autour, aucun
+bloc de code markdown, juste le JSON brut) au format:
 
 {
   "decision": "HOLD" | "ENTER" | "EXIT" | "REDUCE",
   "direction": "BUY" | "SELL" | null,
   "sl_propose": <float ou null>,
   "tp_propose": <float ou null>,
-  "raisonnement": "<3-5 phrases expliquant l'analyse et la décision>",
+  "raisonnement": "<3-8 phrases: analyse du contexte, confluences identifiées, justification de la décision>",
   "confiance": "haute" | "moyenne" | "basse",
-  "risques_identifies": ["<risque 1>", "<risque 2>"]
+  "risques_identifies": ["<risque 1>", "<risque 2>", ...],
+  "confluences_utilisees": ["<confluence 1>", "<confluence 2>", ...]
 }
 
 Règles de format strictes:
-- Pour HOLD: direction=null, sl_propose=null, tp_propose=null
-- Pour ENTER: direction, sl_propose, tp_propose obligatoires
-- Pour EXIT: direction=null (on ferme la position existante), sl/tp=null
-- Pour REDUCE: direction=null, sl_propose=nouveau SL au breakeven, tp_propose=null
+- HOLD: direction=null, sl_propose=null, tp_propose=null
+- ENTER: direction (BUY/SELL), sl_propose, tp_propose OBLIGATOIRES
+- EXIT: direction=null (ferme la position existante), sl/tp=null
+- REDUCE: direction=null, sl_propose=nouveau SL au breakeven, tp_propose=null
 
-Rappel critique: le risk manager côté code va vérifier ta décision.
-Si tu proposes ENTER mais qu'une règle est violée (R:R<2, perte du jour ≥25$,
-position corrélée existante, etc.), la décision sera automatiquement forcée en HOLD.
-Ne tente PAS de contourner ces règles — reconnais-les et respecte-les.
-
-Si le contexte est ambigu ou insuffisant, la décision par défaut est HOLD.
-Il vaut mieux rater une opportunité qu'entrer sur un setup incertain.
+## Rappel critique
+- Si tu proposes ENTER mais que le risk manager voit une violation (plafond
+  journalier atteint, position corrélée, R:R trop bas, etc.), ta décision sera
+  automatiquement forcée en HOLD. C'est un filet, pas une opposition à toi.
+- Reconnais les règles et respecte-les — ne tente PAS de les contourner.
+- En cas de doute: HOLD.
 """
 
 
 def build_user_message(dossier: Dict[str, Any]) -> str:
-    """
-    Sérialise le dossier d'analyse en un message utilisateur lisible.
-    Le dossier est passé sous forme JSON pour que Claude puisse le parser
-    de façon fiable et raisonner sur chaque champ.
-    """
+    """Sérialise le dossier en un message utilisateur lisible pour Claude."""
     return (
-        "Voici le dossier d'analyse pour le cycle actuel. Analyse-le "
+        "Voici le dossier d'analyse complet pour le cycle actuel. Analyse-le "
         "rigoureusement et retourne UNIQUEMENT un objet JSON valide (aucun "
         "texte autour, aucun bloc de code markdown, juste le JSON brut).\n\n"
-        f"```json\n{json.dumps(dossier, ensure_ascii=False, indent=2)}\n```"
+        f"```json\n{json.dumps(dossier, ensure_ascii=False, indent=2, default=str)}\n```"
     )
 
 
 def _extract_json_from_response(text: str) -> Dict[str, Any]:
-    """
-    Parse la réponse de Claude et extrait l'objet JSON.
-    Tolère les blocs markdown ```json ... ``` au cas où (même si le prompt
-    demande du JSON brut, on est défensif).
-    """
+    """Parse la réponse de Claude et extrait l'objet JSON."""
     text = text.strip()
 
-    # Retirer les fences markdown si présentes
     if text.startswith("```"):
-        # Retirer la première ligne (```json ou ```)
         lines = text.split("\n")
         lines = lines[1:]
-        # Retirer la dernière ligne si c'est ```
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         text = "\n".join(lines)
 
-    # Trouver le premier { et le dernier } pour extraire le JSON même s'il y
-    # a du texte parasite avant/après
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end < start:
@@ -177,10 +210,6 @@ VALID_CONFIDENCE = ("haute", "moyenne", "basse")
 
 
 def validate_decision(decision: Dict[str, Any]) -> None:
-    """
-    Vérifie que la décision retournée par Claude a bien tous les champs
-    requis et des valeurs cohérentes. Lève ClaudeAdvisorError sinon.
-    """
     for field in REQUIRED_FIELDS:
         if field not in decision:
             raise ClaudeAdvisorError(f"Champ manquant dans la réponse Claude: {field}")
@@ -197,7 +226,6 @@ def validate_decision(decision: Dict[str, Any]) -> None:
     if not isinstance(decision["risques_identifies"], list):
         raise ClaudeAdvisorError("risques_identifies doit être une liste")
 
-    # Cohérence par type de décision
     if decision["decision"] == "ENTER":
         if decision["direction"] not in ("BUY", "SELL"):
             raise ClaudeAdvisorError("ENTER exige une direction BUY ou SELL")
@@ -206,10 +234,6 @@ def validate_decision(decision: Dict[str, Any]) -> None:
 
 
 def default_hold_decision(reason: str) -> Dict[str, Any]:
-    """
-    Décision par défaut en cas d'échec technique (API down, timeout, JSON invalide).
-    Sécurité maximale: HOLD.
-    """
     return {
         "decision": "HOLD",
         "direction": None,
@@ -218,6 +242,7 @@ def default_hold_decision(reason: str) -> Dict[str, Any]:
         "raisonnement": f"[Fallback automatique — décision par défaut car {reason}]",
         "confiance": "basse",
         "risques_identifies": [f"Fallback technique: {reason}"],
+        "confluences_utilisees": [],
     }
 
 
@@ -227,11 +252,8 @@ def ask_claude(
     client: Optional[httpx.Client] = None,
 ) -> Dict[str, Any]:
     """
-    Envoie le dossier d'analyse à Claude Opus et retourne sa décision.
-
-    En cas d'erreur (config manquante, API down, timeout, JSON invalide,
-    validation échouée), retourne une décision HOLD par défaut plutôt que
-    de lever une exception — la sécurité prime, le trading continue.
+    Envoie le dossier à Claude Opus et retourne sa décision.
+    Fallback HOLD sur toute erreur.
     """
     try:
         cfg = config or get_config()
