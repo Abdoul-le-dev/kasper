@@ -47,18 +47,33 @@ def _today_str() -> str:
 # --- Construction du payload (section 10) ---
 
 def build_payload(declencheur: str = "cyclique_30min", client: Optional[httpx.Client] = None) -> Dict[str, Any]:
-    """Assemble le payload complet à partir des données OANDA + état local (journal)."""
+    """
+    Assemble le payload complet à partir des données MetaApi + état local (journal).
+    
+    IMPORTANT: on ajoute un petit délai (0.3s) entre chaque requête MetaApi pour
+    éviter de saturer le rate limit "requests per minute". Total ajouté par cycle:
+    ~2.7 secondes, négligeable par rapport à la latence Claude (10-20s).
+    """
+    _INTER_REQUEST_DELAY = 0.3  # secondes entre requêtes MetaApi
     config = broker.get_config()
 
     account = broker.get_account_summary(config=config, client=client)
+    time.sleep(_INTER_REQUEST_DELAY)
     pricing = broker.get_pricing(instrument=INSTRUMENT, config=config, client=client)
+    time.sleep(_INTER_REQUEST_DELAY)
 
     d1 = broker.get_candles("D1", count=100, instrument=INSTRUMENT, config=config, client=client)
+    time.sleep(_INTER_REQUEST_DELAY)
     h4 = broker.get_candles("H4", count=100, instrument=INSTRUMENT, config=config, client=client)
+    time.sleep(_INTER_REQUEST_DELAY)
     h1 = broker.get_candles("H1", count=100, instrument=INSTRUMENT, config=config, client=client)
+    time.sleep(_INTER_REQUEST_DELAY)
     m30 = broker.get_candles("M30", count=80, instrument=INSTRUMENT, config=config, client=client)
+    time.sleep(_INTER_REQUEST_DELAY)
     m15 = broker.get_candles("M15", count=60, instrument=INSTRUMENT, config=config, client=client)
+    time.sleep(_INTER_REQUEST_DELAY)
     m5 = broker.get_candles("M5", count=60, instrument=INSTRUMENT, config=config, client=client)
+    time.sleep(_INTER_REQUEST_DELAY)
 
     raw_trades = broker.get_open_trades(instrument=INSTRUMENT, config=config, client=client)
     positions_ouvertes = []
@@ -241,8 +256,16 @@ def monitor_urgent_conditions() -> None:
     _last_price_seen = pricing["actuel"]
 
 
-def avg_spread_gap_threshold(gap: float, threshold: float = 3.0) -> bool:
-    """Seuil de gap jugé significatif (en $ sur XAU_USD) — ajustable selon la volatilité observée."""
+def avg_spread_gap_threshold(gap: float, threshold: float = 15.0) -> bool:
+    """
+    Seuil de gap jugé significatif (en $ sur XAUUSD).
+    
+    Ancien seuil fixe: 3.0 → trop sensible, spammait Telegram avec des mouvements
+    normaux de session (3-5$ en 5 min est fréquent sur l'or).
+    
+    Nouveau seuil: 15.0 → correspond à un vrai gap anormal (news bombe, ouverture
+    de session avec écart). Sur XAUUSD, 15$ en 5 min c'est vraiment exceptionnel.
+    """
     return gap > threshold
 
 
@@ -325,89 +348,50 @@ def _adaptive_cycle_scheduler() -> None:
     Scheduler personnalisé qui adapte l'intervalle selon la session.
     Session US ouverte → 10 min, hors → 20 min, weekend → 30 min.
 
-    Anti-429: si MetaApi renvoie un rate limit, on pause tout pendant
-    RATE_LIMIT_PAUSE_SECONDS au lieu de continuer à bombarder.
+    Les erreurs MetaApi (429, timeout, 5xx) sont maintenant gérées par le
+    retry automatique avec backoff exponentiel dans metaapi_connector._request.
+    Si un cycle échoue malgré les retries, on log et on passe au suivant.
     """
-    from . import metaapi_connector as broker_module
-
-    RATE_LIMIT_PAUSE_SECONDS = 600  # 10 minutes
-
     last_cycle_time = time.time()
     last_recap_time = time.time()
     last_monitor_time = time.time()
-    paused_until = 0.0  # timestamp UNIX jusqu'auquel on est en pause
 
     # Premier cycle immédiat
     try:
         run_cycle(declencheur="cyclique_start")
-    except broker_module.MetaApiRateLimitError:
-        logger.warning(
-            "Rate limit MetaApi (429) au premier cycle — pause de %d secondes",
-            RATE_LIMIT_PAUSE_SECONDS
-        )
-        paused_until = time.time() + RATE_LIMIT_PAUSE_SECONDS
-        try:
-            tg.notify_urgent_alert(
-                f"⏸ Rate limit MetaApi détecté (429) — pause de {RATE_LIMIT_PAUSE_SECONDS // 60} min. "
-                "Vérifie ton quota sur app.metaapi.cloud si ça se reproduit."
-            )
-        except Exception:
-            pass
+        logger.info("Premier cycle terminé avec succès")
     except Exception:
-        logger.exception("Erreur au premier cycle (poursuite)")
+        logger.exception("Erreur au premier cycle (poursuite au cycle suivant)")
 
     while True:
         try:
             now = time.time()
 
-            # Si on est en pause anti-429, on saute tout jusqu'à expiration
-            if now < paused_until:
-                time.sleep(60)
-                continue
-            elif paused_until > 0:
-                # On sort de pause, on reset le compteur
-                logger.info("Fin de pause anti-429, reprise du trading")
-                paused_until = 0.0
-                last_cycle_time = now  # forcer un cycle immédiat après pause
-
             # Cycle principal selon session
             interval_seconds = get_current_cycle_interval_minutes() * 60
             if now - last_cycle_time >= interval_seconds:
+                logger.info("Démarrage cycle (intervalle actuel: %d min)", interval_seconds // 60)
                 try:
                     run_cycle(declencheur="cyclique_adaptatif")
-                    last_cycle_time = now
-                except broker_module.MetaApiRateLimitError:
-                    logger.warning(
-                        "Rate limit MetaApi (429) — pause de %d secondes",
-                        RATE_LIMIT_PAUSE_SECONDS
-                    )
-                    paused_until = time.time() + RATE_LIMIT_PAUSE_SECONDS
-                    try:
-                        tg.notify_urgent_alert(
-                            f"⏸ Rate limit MetaApi (429) — pause automatique de {RATE_LIMIT_PAUSE_SECONDS // 60} min."
-                        )
-                    except Exception:
-                        pass
-                    continue
+                    logger.info("Cycle terminé avec succès")
                 except Exception:
                     logger.exception("Erreur pendant run_cycle (poursuite au cycle suivant)")
-                    last_cycle_time = now
+                last_cycle_time = now
 
             # Récap consolidé toutes les 30 min
-            if now - last_recap_time >= 1800:  # 30 min
-                send_periodic_recap()
+            if now - last_recap_time >= 1800:
+                try:
+                    send_periodic_recap()
+                except Exception:
+                    logger.exception("Erreur envoi récap Telegram (non bloquant)")
                 last_recap_time = now
 
-            # Surveillance légère toutes les 5 min (au lieu de 60s)
-            # Réduit fortement la pression sur MetaApi en tâche de fond
+            # Surveillance légère toutes les 5 min
             if now - last_monitor_time >= 300:
                 try:
                     monitor_urgent_conditions()
-                except broker_module.MetaApiRateLimitError:
-                    logger.warning("Rate limit MetaApi pendant surveillance légère — pause")
-                    paused_until = time.time() + RATE_LIMIT_PAUSE_SECONDS
                 except Exception:
-                    logger.exception("Erreur surveillance légère (poursuite)")
+                    logger.exception("Erreur surveillance légère (non bloquant)")
                 last_monitor_time = now
 
             time.sleep(60)

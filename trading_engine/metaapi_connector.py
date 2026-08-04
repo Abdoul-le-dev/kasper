@@ -97,21 +97,70 @@ def _request(
     client: Optional[httpx.Client] = None,
     params: Optional[Dict[str, Any]] = None,
     json_body: Optional[Dict[str, Any]] = None,
+    max_retries: int = 3,
 ) -> Any:
-    """Effectue une requête HTTP vers MetaApi et lève MetaApiError si non-2xx."""
+    """
+    Effectue une requête HTTP vers MetaApi avec retry automatique en cas
+    d'erreur transitoire (429, 502, 503, timeout).
+
+    Backoff exponentiel: 2s, 5s, 10s entre les tentatives.
+    Après max_retries échecs, lève l'exception finale.
+    """
+    import time as _time
     owns_client = client is None
-    http_client = client or httpx.Client(timeout=30.0)
+    http_client = client or httpx.Client(timeout=60.0)
+
+    backoff_delays = [2, 5, 10]  # secondes entre les retries
+    last_error = None
+
     try:
-        response = http_client.request(
-            method, url, headers=_headers(config), params=params, json=json_body
-        )
-        if response.status_code == 429:
-            raise MetaApiRateLimitError(429, response.text)
-        if response.status_code not in (200, 201, 204):
-            raise MetaApiError(response.status_code, response.text)
-        if response.status_code == 204:
-            return {}
-        return response.json()
+        for attempt in range(max_retries + 1):
+            try:
+                response = http_client.request(
+                    method, url, headers=_headers(config), params=params, json=json_body
+                )
+
+                # Erreurs transitoires : on retente
+                if response.status_code in (429, 502, 503, 504):
+                    last_error = MetaApiRateLimitError(
+                        response.status_code, response.text[:300]
+                    ) if response.status_code == 429 else MetaApiError(
+                        response.status_code, response.text[:300]
+                    )
+                    if attempt < max_retries:
+                        delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
+                        logger.warning(
+                            "MetaApi %s (tentative %d/%d) — retry dans %ds",
+                            response.status_code, attempt + 1, max_retries + 1, delay,
+                        )
+                        _time.sleep(delay)
+                        continue
+                    # Dernier retry épuisé : on lève
+                    raise last_error
+
+                # Erreurs non-transitoires : on lève immédiatement
+                if response.status_code not in (200, 201, 204):
+                    raise MetaApiError(response.status_code, response.text[:300])
+
+                if response.status_code == 204:
+                    return {}
+                return response.json()
+
+            except httpx.TimeoutException as exc:
+                last_error = exc
+                if attempt < max_retries:
+                    delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
+                    logger.warning(
+                        "MetaApi timeout (tentative %d/%d) — retry dans %ds",
+                        attempt + 1, max_retries + 1, delay,
+                    )
+                    _time.sleep(delay)
+                    continue
+                raise MetaApiError(0, f"Timeout après {max_retries + 1} tentatives") from exc
+
+        # Ne devrait jamais atteindre ici
+        if last_error:
+            raise last_error
     finally:
         if owns_client:
             http_client.close()
