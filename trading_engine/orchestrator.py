@@ -62,9 +62,9 @@ def build_payload(declencheur: str = "cyclique_30min", client: Optional[httpx.Cl
     pricing = broker.get_pricing(instrument=INSTRUMENT, config=config, client=client)
     time.sleep(_INTER_REQUEST_DELAY)
 
-    d1 = broker.get_candles("D1", count=100, instrument=INSTRUMENT, config=config, client=client)
+    d1 = broker.get_candles("D1", count=210, instrument=INSTRUMENT, config=config, client=client)
     time.sleep(_INTER_REQUEST_DELAY)
-    h4 = broker.get_candles("H4", count=100, instrument=INSTRUMENT, config=config, client=client)
+    h4 = broker.get_candles("H4", count=210, instrument=INSTRUMENT, config=config, client=client)
     time.sleep(_INTER_REQUEST_DELAY)
     h1 = broker.get_candles("H1", count=100, instrument=INSTRUMENT, config=config, client=client)
     time.sleep(_INTER_REQUEST_DELAY)
