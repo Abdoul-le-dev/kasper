@@ -26,8 +26,8 @@ LONDON_END = 16
 NY_START = 13
 NY_END = 22
 
-CYCLE_MINUTES_US_SESSION = 5
-CYCLE_MINUTES_OFF_SESSION = 25
+CYCLE_MINUTES_US_SESSION = 10   # AOÛT : 10 min (au lieu de 5) — équilibre entre réactivité et quota MetaApi
+CYCLE_MINUTES_OFF_SESSION = 20  # AOÛT : 20 min (au lieu de 25)
 CYCLE_MINUTES_WEEKEND = 30
 
 

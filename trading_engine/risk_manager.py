@@ -1,14 +1,14 @@
 """
 risk_manager.py
 
-Gestion du risque — paramètres non négociables du système (section 8 de la spec).
+Gestion du risque — paramètres non négociables du système.
 
-RÈGLES FIGÉES (ne pas modifier sans validation explicite du gestionnaire):
+RÈGLES FIGÉES (VERSION AOÛT — marché de range étroit):
 - Risque minimum par trade: 5$ (5% d'un capital de 100$)
 - Perte maximale journalière: 25$ (25%)
 - Pas de plafond de perte cumulée sur 7 jours (budget rechargé chaque jour)
 - Maximum 2 positions simultanées
-- R:R minimum exigé: 2.0
+- R:R minimum exigé: 1.5 (au lieu de 2.0 — adapté aux ranges étroits d'août)
 - Maximum 5 trades perdants par jour (25$ / 5$)
 """
 
@@ -16,12 +16,12 @@ from dataclasses import dataclass
 from typing import List, Dict, Optional
 
 
-# --- Constantes de risque (figées par la spec) ---
+# --- Constantes de risque ---
 RISK_PER_TRADE_MIN_DOLLARS = 5.0
 DAILY_LOSS_MAX_DOLLARS = 25.0
 DAILY_LOSS_ALERT_THRESHOLD_DOLLARS = 20.0
 MAX_OPEN_POSITIONS = 2
-MIN_RISK_REWARD = 2.0
+MIN_RISK_REWARD = 1.5  # AOÛT : abaissé de 2.0 à 1.5
 MAX_LOSING_TRADES_PER_DAY = 5
 
 

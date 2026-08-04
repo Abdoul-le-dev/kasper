@@ -60,7 +60,13 @@ def compute_volatility_regime(payload: Dict) -> Dict:
 
 
 def compute_zones(payload: Dict) -> List[Dict]:
-    return zn.identify_zones(payload["D1"]["ohlc"], payload["H4"]["ohlc"], max_zones=6)
+    """Calcule les zones à partir de D1+H4, ou H4 seul si D1 absent (version août)."""
+    d1_ohlc = payload.get("D1", {}).get("ohlc") if payload.get("D1") else None
+    h4_ohlc = payload["H4"]["ohlc"]
+    if d1_ohlc:
+        return zn.identify_zones(d1_ohlc, h4_ohlc, max_zones=6)
+    # Sans D1 : on utilise H4 deux fois (comme approximation)
+    return zn.identify_zones(h4_ohlc, h4_ohlc, max_zones=6)
 
 
 # --- Utilitaires pour alléger les bougies avant envoi ---
@@ -163,11 +169,11 @@ def build_dossier(payload: Dict) -> Dict[str, Any]:
             "spread": payload["prix"].get("spread"),
         },
         "bougies_brutes": {
-            "D1": _round_ohlc(payload["D1"]["ohlc"], max_candles=100),
             "H4": _round_ohlc(payload["H4"]["ohlc"], max_candles=100),
-            "H1": _round_ohlc(payload["H1"]["ohlc"], max_candles=60),
+            "H1": _round_ohlc(payload["H1"]["ohlc"], max_candles=100),
+            "M30": _round_ohlc((payload.get("M30") or {}).get("ohlc", []), max_candles=80),
             "M15": _round_ohlc(payload["M15"]["ohlc"], max_candles=60),
-            "M5": _round_ohlc(payload["M5"]["ohlc"], max_candles=40),
+            "M5": _round_ohlc(payload["M5"]["ohlc"], max_candles=60),
         },
         "indicateurs_calcules": {
             "ema50_h4": round(bias["ema50_h4"], 3),

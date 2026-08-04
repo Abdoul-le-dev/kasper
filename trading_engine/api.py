@@ -81,9 +81,10 @@ class AnalyzeRequest(BaseModel):
     timestamp: str
     compte: CompteInfo
     prix: PrixInfo
-    D1: TimeframeData
+    D1: Optional[TimeframeData] = None  # optionnel — version août utilise H4/H1/M30
     H4: TimeframeData
     H1: TimeframeData
+    M30: Optional[TimeframeData] = None  # AJOUTÉ pour version août
     M15: TimeframeData
     M5: TimeframeData
     evenements_macro_a_venir: List[MacroEvent] = Field(default_factory=list)
