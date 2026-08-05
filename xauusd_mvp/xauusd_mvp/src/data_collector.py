@@ -127,7 +127,13 @@ async def fetch_hour(
     dt: datetime,
     semaphore: asyncio.Semaphore,
 ) -> bytes:
-    """Télécharge (ou lit du cache) le .bi5 d'une heure. Retourne bytes bruts."""
+    """Télécharge (ou lit du cache) le .bi5 d'une heure. Retourne bytes bruts.
+
+    Gestion différenciée des erreurs :
+    - 404 : heure sans données, on cache un blob vide.
+    - 429 : rate limit, on attend longtemps (45s) puis on retry.
+    - Autres HTTPError : backoff exponentiel classique.
+    """
     cp = cache_path(dt)
     if cp.exists():
         return cp.read_bytes()
@@ -138,9 +144,15 @@ async def fetch_hour(
             try:
                 resp = await client.get(url, timeout=config.DUKASCOPY_TIMEOUT_S)
                 if resp.status_code == 404:
-                    # Heure sans données — on cache un blob vide pour éviter de retry
                     cp.write_bytes(b"")
                     return b""
+                if resp.status_code == 429:
+                    # Rate limit : on attend beaucoup plus longtemps.
+                    wait = config.DUKASCOPY_RATE_LIMIT_SLEEP_S
+                    logger.warning("429 on %s — sleeping %ds (attempt %d/%d)",
+                                   url, wait, attempt + 1, config.DUKASCOPY_RETRY_MAX)
+                    await asyncio.sleep(wait)
+                    continue
                 resp.raise_for_status()
                 cp.write_bytes(resp.content)
                 return resp.content
@@ -214,8 +226,8 @@ async def collect_all_m1(start_date: date, end_date: date) -> pl.DataFrame:
     all_bars: List[MinuteBar] = []
 
     async with httpx.AsyncClient(http2=False, follow_redirects=True) as client:
-        # On traite par batches pour libérer la mémoire
-        BATCH = 200
+        # On traite par batches pour libérer la mémoire ET pour lisser le débit
+        BATCH = 100
         for i in range(0, total, BATCH):
             batch = hours[i : i + BATCH]
             tasks = [fetch_hour(client, dt, semaphore) for dt in batch]
@@ -227,6 +239,9 @@ async def collect_all_m1(start_date: date, end_date: date) -> pl.DataFrame:
             pct = 100 * done / total
             logger.info("Progress: %d / %d hours (%.1f%%) — %d M1 bars collected",
                         done, total, pct, len(all_bars))
+            # Petite pause entre batches pour éviter de saturer Dukascopy
+            if done < total:
+                await asyncio.sleep(config.DUKASCOPY_BATCH_SLEEP_S)
 
     if not all_bars:
         return pl.DataFrame()
