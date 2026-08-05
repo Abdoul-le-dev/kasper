@@ -37,6 +37,10 @@ class SupertrendAtrConfig(StrategyConfig):
     # Distribution observée : min=12.6, p25=16.2, med=18.0.
     # h1_atr_min=15 → garde ~80% du temps, filtre les 20% les plus plats.
     h1_atr_min: float = 15.0
+    # Time-based exit : ferme la position après N bougies M5 si ni SL ni TP touchés.
+    # Observation train : durée moyenne 361 min = 72 bougies. On coupe court à 18 (90 min)
+    # pour éviter que la logique "flip = tendance qui démarre" ne se dilue dans le temps.
+    time_exit_bars: int = 18
 
 
 class SupertrendAtrStrategy(BaseStrategy):

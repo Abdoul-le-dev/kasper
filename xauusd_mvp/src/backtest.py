@@ -79,9 +79,10 @@ class Trade:
     tp: float
     lot: float
     exit_price: Optional[float] = None
-    exit_reason: Optional[str] = None   # "TP", "SL", "END"
+    exit_reason: Optional[str] = None   # "TP", "SL", "TIME", "END"
     pnl_usd: float = 0.0
     session: str = "?"
+    bars_held: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +162,11 @@ def run_backtest(
 
     slip_price = slippage_ticks * config.XAUUSD_TICK_SIZE
 
+    # time_exit_bars : si la stratégie a un attribut cfg.time_exit_bars > 0,
+    # on ferme la position au close de la N-ième bougie après entrée.
+    # 0 ou absent → pas de time exit.
+    time_exit_bars = int(getattr(strategy.cfg, "time_exit_bars", 0) or 0)
+
     for i in range(n):
         ts = ts_arr[i]
         this_day = ts.date() if hasattr(ts, "date") else date.fromisoformat(str(ts)[:10])
@@ -172,6 +178,7 @@ def run_backtest(
 
         # 1) Gérer la position ouverte : check SL / TP sur la bougie courante
         if open_pos is not None:
+            open_pos.bars_held += 1
             hit_sl = False
             hit_tp = False
             if open_pos.direction == "BUY":
@@ -193,22 +200,20 @@ def run_backtest(
                 exit_price, exit_reason = open_pos.sl, "SL"
             elif hit_tp:
                 exit_price, exit_reason = open_pos.tp, "TP"
+            elif time_exit_bars > 0 and open_pos.bars_held >= time_exit_bars:
+                # Time-based exit : ni SL ni TP touchés, on ferme au close courant
+                exit_price, exit_reason = c[i], "TIME"
             else:
                 exit_price, exit_reason = None, None
 
             if exit_price is not None:
-                # Slippage : mauvais pour nous (SL plus profond, TP moins loin)
+                # Slippage : mauvais pour nous sur SL et TP.
+                # Sur TIME exit, on applique aussi le slippage (exécution au close+spread).
                 if open_pos.direction == "BUY":
-                    if exit_reason == "SL":
-                        exit_price -= slip_price
-                    else:
-                        exit_price -= slip_price
+                    exit_price -= slip_price
                     price_move = exit_price - open_pos.entry_price
                 else:
-                    if exit_reason == "SL":
-                        exit_price += slip_price
-                    else:
-                        exit_price += slip_price
+                    exit_price += slip_price
                     price_move = open_pos.entry_price - exit_price
 
                 pnl = (price_move / PIP_SIZE_XAUUSD) * PIP_VALUE_PER_LOT * open_pos.lot
