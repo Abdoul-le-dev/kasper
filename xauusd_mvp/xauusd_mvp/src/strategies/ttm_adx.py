@@ -31,7 +31,12 @@ class TtmAdxConfig(StrategyConfig):
     mult_kc: float = 1.5
     adx_min: float = 20.0
     atr_length: int = 14
-    tp_k: float = 2.0
+    # Dimensionnement XAUUSD 2026 (ATR M5 ~5$):
+    # SL au low/high de la M5 de breakout est ~5-8$, trop serré → mangé par bruit.
+    # On élargit à sl_k × ATR pour laisser respirer.
+    # sl_k=2.0 → SL à ~10$, tp_k=3.5 → TP à ~17.5$, R:R = 1.75 : conforme.
+    sl_k: float = 2.0
+    tp_k: float = 3.5
 
 
 class TtmAdxStrategy(BaseStrategy):
@@ -75,11 +80,11 @@ class TtmAdxStrategy(BaseStrategy):
 
             if c[i] > o[i]:
                 signal[i] = "BUY"
-                sl[i] = l[i]
+                sl[i] = c[i] - cfg.sl_k * a_m5[i]
                 tp[i] = c[i] + cfg.tp_k * a_m5[i]
             elif c[i] < o[i]:
                 signal[i] = "SELL"
-                sl[i] = h[i]
+                sl[i] = c[i] + cfg.sl_k * a_m5[i]
                 tp[i] = c[i] - cfg.tp_k * a_m5[i]
 
         return df_m5.with_columns([

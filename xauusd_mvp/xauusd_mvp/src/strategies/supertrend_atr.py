@@ -28,8 +28,15 @@ class SupertrendAtrConfig(StrategyConfig):
     st_length: int = 10
     st_factor: float = 3.0
     atr_length: int = 14
-    tp_k: float = 2.0
-    h1_atr_min: float = 1.0  # USD (or ~10 pips)
+    # Note dimensionnement 2026 (XAUUSD ~4000 $, ATR M5 ~5$, ATR H1 ~18$):
+    # SuperTrend factor 3 → SL à ~3×ATR de distance.
+    # Pour R:R ≥ 1.5, il faut tp_k > 4.5 × ATR M5.
+    # tp_k = 5.0 → TP à 25 $, SL à 15 $, R:R = 1.67 : conforme.
+    tp_k: float = 5.0
+    # Seuil ATR H1 minimum : on veut filtrer les phases très calmes.
+    # Distribution observée : min=12.6, p25=16.2, med=18.0.
+    # h1_atr_min=15 → garde ~80% du temps, filtre les 20% les plus plats.
+    h1_atr_min: float = 15.0
 
 
 class SupertrendAtrStrategy(BaseStrategy):
