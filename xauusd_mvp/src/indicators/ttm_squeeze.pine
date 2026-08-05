@@ -1,0 +1,35 @@
+// Source: TTM Squeeze (John Carter, 2007) — LazyBear implementation
+// Reference public Pine: https://www.tradingview.com/script/nqQ1DT5a-Squeeze-Momentum-Indicator-LazyBear/
+//
+// Definition:
+//   BB   : Bollinger Bands with length=20, mult_bb=2.0
+//          basis = SMA(close, 20)
+//          upperBB = basis + mult_bb * stdev(close, 20)
+//          lowerBB = basis - mult_bb * stdev(close, 20)
+//   KC   : Keltner Channels with length=20, mult_kc=1.5
+//          ma = SMA(close, 20)
+//          range_ma = SMA(TR, 20)                    // LazyBear variant uses TR, not ATR
+//          upperKC = ma + mult_kc * range_ma
+//          lowerKC = ma - mult_kc * range_ma
+//   squeezeOn  = lowerBB > lowerKC and upperBB < upperKC   // BB inside KC
+//   squeezeOff = lowerBB < lowerKC and upperBB > upperKC   // BB outside KC
+//
+// Momentum histogram: linear regression of (close - avg(highest+lowest, sma(close))) length=20
+// But for our strategy we only need the squeeze on/off flag.
+//
+// Pine snippet (simplified):
+//   //@version=5
+//   indicator("TTM Squeeze")
+//   length = input.int(20, "Length")
+//   mult_bb = input.float(2.0, "BB Mult")
+//   mult_kc = input.float(1.5, "KC Mult")
+//   basis = ta.sma(close, length)
+//   dev = mult_bb * ta.stdev(close, length)
+//   upperBB = basis + dev
+//   lowerBB = basis - dev
+//   ma = ta.sma(close, length)
+//   range_ma = ta.sma(ta.tr(true), length)
+//   upperKC = ma + range_ma * mult_kc
+//   lowerKC = ma - range_ma * mult_kc
+//   squeezeOn  = lowerBB > lowerKC and upperBB < upperKC
+//   squeezeOff = lowerBB < lowerKC and upperBB > upperKC

@@ -1,0 +1,19 @@
+// Source: ADX/DMI (Welles Wilder, 1978) — Pine v5 `ta.dmi()`
+// Reference: https://www.tradingview.com/pine-script-reference/v5/#fun_ta{dot}dmi
+//
+// Definition:
+//   +DM  = high - high[1] if (high - high[1]) > (low[1] - low) and > 0 else 0
+//   -DM  = low[1] - low   if (low[1] - low)   > (high - high[1]) and > 0 else 0
+//   TR   = true_range (as ATR)
+//   +DI  = 100 * RMA(+DM, length) / RMA(TR, length)
+//   -DI  = 100 * RMA(-DM, length) / RMA(TR, length)
+//   DX   = 100 * |+DI - -DI| / (+DI + -DI)
+//   ADX  = RMA(DX, adxLength)
+//
+// Pine snippet:
+//   //@version=5
+//   indicator("ADX")
+//   diLen  = input.int(14, "DI Length")
+//   adxLen = input.int(14, "ADX Length")
+//   [diPlus, diMinus, adx] = ta.dmi(diLen, adxLen)
+//   plot(adx)
