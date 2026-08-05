@@ -13,7 +13,7 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # dotenv optionnel, les vars peuvent aussi venir de l'environnement système
+    pass  # dotenv optionnel
 
 # --- Chemins ---
 ROOT = Path(__file__).parent
@@ -27,16 +27,16 @@ for d in (DATA_DIR, QUARANTINE_DIR, REPORTS_DIR, LOGS_DIR):
 
 # --- Actif ---
 SYMBOL = "XAUUSD"
-DUKASCOPY_INSTRUMENT = "XAUUSD"  # code Dukascopy
+DUKASCOPY_INSTRUMENT = "XAUUSD"
 BROKER_SYMBOL = os.environ.get("METAAPI_SYMBOL", "XAUUSD")
 
 # --- Fenêtre historique ---
-# 12 mois glissants jusqu'à hier UTC. Les 2 derniers mois vont en quarantaine.
+# MVP allégé : 45 jours au total, dont 15 jours en quarantaine.
+# → 30 jours train / 15 jours quarantaine
 TODAY = date.today()
-HISTORY_END = TODAY - timedelta(days=1)          # hier
-HISTORY_START = HISTORY_END - timedelta(days=45)   # 1,5 mois au lieu de 12
-QUARANTINE_START = HISTORY_END - timedelta(days=15)  # 15 jours quarantaine
-
+HISTORY_END = TODAY - timedelta(days=1)
+HISTORY_START = HISTORY_END - timedelta(days=45)
+QUARANTINE_START = HISTORY_END - timedelta(days=15)
 
 # --- Timeframes ---
 TIMEFRAMES = ["M1", "M5", "M15", "M30", "H1"]
@@ -47,20 +47,19 @@ LONDON_START_HOUR = 7
 LONDON_END_HOUR = 16
 NY_START_HOUR = 13
 NY_END_HOUR = 22
-# Overlap = intersection = 13-16 UTC
 
 TRADING_SESSIONS = {"london", "new_york", "overlap_london_ny"}
 
 # --- Risque (kill switch dur) ---
 DAILY_LOSS_MAX_DOLLARS = float(os.environ.get("DAILY_LOSS_MAX_DOLLARS", "50"))
-MAX_OPEN_POSITIONS = 1  # une seule position à la fois (spec)
-MIN_RISK_REWARD = 1.5   # non négociable sans revalidation
+MAX_OPEN_POSITIONS = 1
+MIN_RISK_REWARD = 1.5
 
 # --- Backtest / broker ---
-COMMISSION_PER_LOT_USD = 7.0   # XM standard sur XAUUSD (aller-retour)
-SLIPPAGE_TICKS = 1              # 1 tick = 0.10 $ sur XAUUSD
+COMMISSION_PER_LOT_USD = 7.0
+SLIPPAGE_TICKS = 1
 XAUUSD_TICK_SIZE = 0.01
-XAUUSD_CONTRACT_SIZE = 100      # 100 oz par lot standard
+XAUUSD_CONTRACT_SIZE = 100
 
 # --- Live / paper ---
 LIVE_ENABLED = os.environ.get("LIVE_ENABLED", "false").lower() == "true"
@@ -71,12 +70,13 @@ METAAPI_REGION = os.environ.get("METAAPI_REGION", "new-york")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# --- Dukascopy ---
+# --- Dukascopy (rate limit prudent) ---
 DUKASCOPY_BASE_URL = "https://datafeed.dukascopy.com/datafeed"
-DUKASCOPY_MAX_CONCURRENCY = 8    # limite polie pour éviter d'être blacklisté
-DUKASCOPY_RETRY_MAX = 3
+DUKASCOPY_MAX_CONCURRENCY = 2
+DUKASCOPY_RETRY_MAX = 5
 DUKASCOPY_TIMEOUT_S = 30
-# Pour XAUUSD, Dukascopy encode les prix en int × 1000 (or coté avec 3 décimales)
+DUKASCOPY_BATCH_SLEEP_S = 1.0
+DUKASCOPY_RATE_LIMIT_SLEEP_S = 45
 DUKASCOPY_PRICE_DIVISOR_XAUUSD = 1000.0
 
 
