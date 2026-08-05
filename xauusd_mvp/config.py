@@ -34,8 +34,9 @@ BROKER_SYMBOL = os.environ.get("METAAPI_SYMBOL", "XAUUSD")
 # 12 mois glissants jusqu'à hier UTC. Les 2 derniers mois vont en quarantaine.
 TODAY = date.today()
 HISTORY_END = TODAY - timedelta(days=1)          # hier
-HISTORY_START = HISTORY_END - timedelta(days=365) # -12 mois
-QUARANTINE_START = HISTORY_END - timedelta(days=60)  # 2 derniers mois
+HISTORY_START = HISTORY_END - timedelta(days=45)   # 1,5 mois au lieu de 12
+QUARANTINE_START = HISTORY_END - timedelta(days=15)  # 15 jours quarantaine
+
 
 # --- Timeframes ---
 TIMEFRAMES = ["M1", "M5", "M15", "M30", "H1"]
