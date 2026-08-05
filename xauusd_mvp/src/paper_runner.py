@@ -382,7 +382,7 @@ async def try_open_position(
     try:
         result = await asyncio.to_thread(
             place_market_order,
-            direction=sig, units=units, sl_price=sl, tp_price=tp,
+            direction=sig, units=units, sl=sl, tp=tp,
         )
         pos_id = result.get("orderId") or result.get("positionId") or result.get("id")
         if not pos_id:

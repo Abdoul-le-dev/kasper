@@ -123,8 +123,8 @@ def main() -> None:
         result = place_market_order(
             direction="BUY",
             units=units,
-            sl_price=sl_price,
-            tp_price=tp_price,
+            sl=sl_price,
+            tp=tp_price,
         )
         print(f"✅ Ordre envoyé, réponse MetaApi :")
         for k, v in result.items():
