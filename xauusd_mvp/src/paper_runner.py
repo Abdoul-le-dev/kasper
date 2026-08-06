@@ -447,9 +447,9 @@ async def main_loop(mode: str) -> None:
     logger.info("Strategy config: %s", STRATEGY_CFG)
     logger.info("Kill switch: %s $/day", config.DAILY_LOSS_MAX_DOLLARS)
     telegram_notify(
-        f"🚀 Système actif\n"
-        f"Stratégie: supertrend_atr\n"
-        f"Kill switch: {config.DAILY_LOSS_MAX_DOLLARS}$/jour"
+        f"🚀 Systeme actif\n"
+        f"Strategie: supertrend\\_atr\n"
+        f"Kill switch: {config.DAILY_LOSS_MAX_DOLLARS}\\$/jour"
     )
 
     state = RunnerState()
