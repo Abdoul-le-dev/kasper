@@ -1,0 +1,11 @@
+[Unit]
+Description=XAUUSD bilan hebdo + flat forcé
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/kasper/xauusd_mvp
+Environment=PATH=/home/ubuntu/kasper/xauusd_mvp/venv/bin:/usr/bin:/bin
+ExecStart=/home/ubuntu/kasper/xauusd_mvp/venv/bin/python -m src.weekly_report
+StandardOutput=append:/home/ubuntu/kasper/xauusd_mvp/logs/weekly_report.log
+StandardError=append:/home/ubuntu/kasper/xauusd_mvp/logs/weekly_report.log

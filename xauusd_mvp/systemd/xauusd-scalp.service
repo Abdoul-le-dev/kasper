@@ -1,0 +1,22 @@
+[Unit]
+Description=XAUUSD scalping paper_runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/kasper/xauusd_mvp
+Environment=PATH=/home/ubuntu/kasper/xauusd_mvp/venv/bin:/usr/bin:/bin
+ExecStart=/home/ubuntu/kasper/xauusd_mvp/venv/bin/python -m src.paper_runner --mode paper
+Restart=always
+RestartSec=15
+StandardOutput=append:/home/ubuntu/kasper/xauusd_mvp/logs/paper_runner.systemd.log
+StandardError=append:/home/ubuntu/kasper/xauusd_mvp/logs/paper_runner.systemd.log
+
+# Sécurité : redémarre max 5 fois en 5 min sinon arrête définitivement
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Install]
+WantedBy=multi-user.target

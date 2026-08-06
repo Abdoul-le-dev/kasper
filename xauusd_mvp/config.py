@@ -51,8 +51,25 @@ NY_END_HOUR = 22
 TRADING_SESSIONS = {"london", "new_york", "overlap_london_ny"}
 
 # --- Risque (kill switch dur) ---
-DAILY_LOSS_MAX_DOLLARS = float(os.environ.get("DAILY_LOSS_MAX_DOLLARS", "50"))
-MAX_OPEN_POSITIONS = 1  # une seule position à la fois (spec)
+INITIAL_CAPITAL_USD = 100.0
+DAILY_LOSS_MAX_DOLLARS = float(os.environ.get("DAILY_LOSS_MAX_DOLLARS", "30"))
+MAX_OPEN_POSITIONS = 1  # par système : le scalp OU l'ordre direct, chacun peut en avoir 1
+MIN_RISK_REWARD = 1.5
+
+MANUAL_PRICE_TOLERANCE_USD = 5.0  # écart max autorisé entre prix tapé et prix marché
+
+BACKTEST_WEEK_STATS = {
+    "strategy": "supertrend_atr",
+    "params": "st_length=10, st_factor=3, tp_k=5, h1_atr_min=15, time_exit=24",
+    "profit_factor_train": 1.12,
+    "profit_factor_quarantine": 2.02,
+    "n_trades_train": 22,
+    "n_trades_quarantine": 4,
+    "period": "30j train + 15j quarantaine",
+    "updated": "2026-08-05",
+}
+
+COMPETITOR_USERNAME = "ChatGPT Trader"
 MIN_RISK_REWARD = 1.5   # non négociable sans revalidation
 
 # --- Backtest / broker ---

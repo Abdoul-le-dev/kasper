@@ -1,0 +1,10 @@
+[Unit]
+Description=Trigger bilan hebdo + flat forcé vendredi 21h UTC
+
+[Timer]
+OnCalendar=Fri *-*-* 21:00:00 UTC
+Persistent=true
+Unit=xauusd-weekly-report.service
+
+[Install]
+WantedBy=timers.target

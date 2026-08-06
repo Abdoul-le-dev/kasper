@@ -1,0 +1,21 @@
+[Unit]
+Description=XAUUSD canal Telegram listener (réactions ChatGPT Trader)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/kasper/xauusd_mvp
+Environment=PATH=/home/ubuntu/kasper/xauusd_mvp/venv/bin:/usr/bin:/bin
+ExecStart=/home/ubuntu/kasper/xauusd_mvp/venv/bin/python -m src.canal_listener
+Restart=always
+RestartSec=15
+StandardOutput=append:/home/ubuntu/kasper/xauusd_mvp/logs/canal_listener.systemd.log
+StandardError=append:/home/ubuntu/kasper/xauusd_mvp/logs/canal_listener.systemd.log
+
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Install]
+WantedBy=multi-user.target

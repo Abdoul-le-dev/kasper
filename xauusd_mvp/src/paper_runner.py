@@ -50,6 +50,10 @@ from src.metaapi_connector import (
     place_market_order, close_trade, calculate_units,
     MetaApiError, MetaApiConfigError,
 )
+from src.shared import (
+    telegram_send as shared_telegram, journal_append as shared_journal_append,
+    is_kill_switch_active, kill_switch_message,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -94,19 +98,14 @@ BAR_ALIGNMENT_MINUTES = 5    # M5 alignée sur clock UTC
 # ---------------------------------------------------------------------------
 
 def telegram_notify(message: str) -> None:
-    """Envoi Telegram best-effort. N'échoue jamais."""
-    if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
-        with httpx.Client(timeout=10) as client:
-            client.post(url, json={
-                "chat_id": config.TELEGRAM_CHAT_ID,
-                "text": message,
-                "parse_mode": "Markdown",
-            })
-    except Exception as e:
-        logger.warning("Telegram failed: %s", e)
+    """Wrapper vers shared.telegram_send (dedupe et anti-boucle)."""
+    shared_telegram(message)
+
+
+def journal_append(kind: str, data: dict) -> None:
+    """Wrapper vers shared.journal_append avec source='scalp'."""
+    entry = {"kind": kind, "source": "scalp", **data}
+    shared_journal_append(entry)
 
 
 # ---------------------------------------------------------------------------
@@ -190,15 +189,7 @@ class RunnerState:
 # ---------------------------------------------------------------------------
 # Journal
 # ---------------------------------------------------------------------------
-
-def journal_append(kind: str, data: dict) -> None:
-    entry = {
-        "ts_utc": datetime.now(timezone.utc).isoformat(),
-        "kind": kind,
-        **data,
-    }
-    with JOURNAL_PATH.open("a") as f:
-        f.write(json.dumps(entry, default=str) + "\n")
+# (journal_append est défini plus haut, wrapper vers shared)
 
 
 def log_error(where: str, exc: Exception) -> None:
@@ -370,12 +361,7 @@ async def try_open_position(
         journal_append("dry_signal", {
             "direction": sig, "entry": entry_price, "sl": sl, "tp": tp, "units": units, "rr": rr,
         })
-        telegram_notify(
-            f"🔵 [DRY] Signal {sig}\n"
-            f"Entry: {entry_price}\n"
-            f"SL: {sl:.2f}  TP: {tp:.2f}\n"
-            f"R:R: {rr:.2f}"
-        )
+        # En mode dry, on ne publie PAS sur Telegram (silencieux, uniquement journal)
         return
 
     # mode paper ou live : vraie ouverture
@@ -395,15 +381,22 @@ async def try_open_position(
             entry_price=float(entry_price),
             sl=float(sl),
             tp=float(tp),
-            lot=units / 100.0,
+            lot=float(units),
             entry_ts=datetime.now(timezone.utc),
         )
         journal_append("position_opened", asdict(state.open_position))
+        # Ton "auto scalp"
+        arrow = "📈" if sig == "BUY" else "📉"
+        pip_size = 0.1
+        sl_pips = abs(entry_price - sl) / pip_size
+        tp_pips = abs(tp - entry_price) / pip_size
         telegram_notify(
-            f"✅ Position ouverte {sig}\n"
-            f"Entry: {entry_price}\n"
-            f"SL: {sl:.2f}  TP: {tp:.2f}\n"
-            f"Lot: {units/100.0:.2f}  R:R: {rr:.2f}"
+            f"{arrow} *SIGNAL {sig} — GOLD*\n\n"
+            f"Entry : `{entry_price:.2f}`\n"
+            f"SL    : `{sl:.2f}`  (-{sl_pips:.0f} pips)\n"
+            f"TP    : `{tp:.2f}`  (+{tp_pips:.0f} pips)\n"
+            f"Lot   : `{units}`\n"
+            f"R:R   : `{rr:.2f}`"
         )
     except Exception as e:
         logger.error("place_market_order failed: %s", e)
@@ -415,17 +408,12 @@ async def loop_iteration(state: RunnerState, mode: str) -> None:
     """Une itération complète : refresh, signaux, gestion position."""
     await refresh_state_daily(state)
 
-    # Kill switch check
-    daily_loss = await compute_daily_pnl(state)
-    if daily_loss >= config.DAILY_LOSS_MAX_DOLLARS:
+    # Kill switch check (utilise shared, partagé avec trade.py)
+    if is_kill_switch_active():
         if not state.kill_switch_until_midnight:
             state.kill_switch_until_midnight = True
-            logger.warning("🛑 KILL SWITCH — perte %s $ ≥ %s $", daily_loss, config.DAILY_LOSS_MAX_DOLLARS)
-            telegram_notify(
-                f"🛑 KILL SWITCH activé\n"
-                f"Perte du jour: {daily_loss:.2f} $ ≥ {config.DAILY_LOSS_MAX_DOLLARS} $\n"
-                f"HOLD jusqu'à minuit UTC"
-            )
+            logger.warning("🛑 KILL SWITCH partagé activé")
+            telegram_notify(kill_switch_message())
         # On peut toujours gérer les positions ouvertes, mais pas en ouvrir de nouvelles
         if state.open_position:
             state.open_position.bars_held += 1
@@ -459,7 +447,7 @@ async def main_loop(mode: str) -> None:
     logger.info("Strategy config: %s", STRATEGY_CFG)
     logger.info("Kill switch: %s $/day", config.DAILY_LOSS_MAX_DOLLARS)
     telegram_notify(
-        f"🚀 paper_runner démarré (mode={mode})\n"
+        f"🚀 Système actif\n"
         f"Stratégie: supertrend_atr\n"
         f"Kill switch: {config.DAILY_LOSS_MAX_DOLLARS}$/jour"
     )
@@ -542,7 +530,6 @@ def main() -> None:
         loop.run_until_complete(main_loop(args.mode))
     finally:
         loop.close()
-        telegram_notify("👋 paper_runner arrêté")
 
 
 if __name__ == "__main__":

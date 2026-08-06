@@ -1,0 +1,11 @@
+[Unit]
+Description=XAUUSD rapport quotidien 20h UTC
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/kasper/xauusd_mvp
+Environment=PATH=/home/ubuntu/kasper/xauusd_mvp/venv/bin:/usr/bin:/bin
+ExecStart=/home/ubuntu/kasper/xauusd_mvp/venv/bin/python -m src.daily_report
+StandardOutput=append:/home/ubuntu/kasper/xauusd_mvp/logs/daily_report.log
+StandardError=append:/home/ubuntu/kasper/xauusd_mvp/logs/daily_report.log
